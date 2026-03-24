@@ -155,15 +155,29 @@ CREATE TABLE IF NOT EXISTS notification (
 CREATE TABLE IF NOT EXISTS call_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     endpoint        TEXT NOT NULL,
+    api_type        TEXT NOT NULL DEFAULT 'rest',   -- rest | graphql
     method          TEXT NOT NULL DEFAULT 'GET',
     status_code     INTEGER,
     etag            TEXT,
     last_modified   TEXT,
     rate_remaining  INTEGER,
     rate_reset      INTEGER,
+    gql_cost        INTEGER,                        -- GraphQL point cost for this query
     cache_hit       INTEGER NOT NULL DEFAULT 0,
     duration_ms     INTEGER,
     called_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+-- Append-only log of every entity change during sync.
+-- Consumers tail this with: SELECT * FROM change_log WHERE id > :last_seen
+CREATE TABLE IF NOT EXISTS change_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,   -- pull_request | notification | branch | repo_event
+    entity_id   INTEGER NOT NULL,
+    event       TEXT NOT NULL,   -- inserted | updated
+    repo_slug   TEXT,
+    payload_json TEXT,
+    occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS poll_state (
@@ -191,6 +205,7 @@ CREATE INDEX IF NOT EXISTS idx_event_repo_type ON repo_event(repo_id, type);
 CREATE INDEX IF NOT EXISTS idx_event_created   ON repo_event(created_at);
 CREATE INDEX IF NOT EXISTS idx_notif_unread    ON notification(unread, updated_at);
 CREATE INDEX IF NOT EXISTS idx_call_endpoint   ON call_log(endpoint, called_at);
+CREATE INDEX IF NOT EXISTS idx_change_log      ON change_log(entity_type, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_branch_repo     ON branch(repo_id);
 
 CREATE VIEW IF NOT EXISTS v_open_prs AS
@@ -333,12 +348,14 @@ pub fn set_poll_state(
 
 pub struct CallLogEntry<'a> {
     pub endpoint: &'a str,
+    pub api_type: &'a str,   // "rest" | "graphql"
     pub method: &'a str,
     pub status_code: Option<u16>,
     pub etag: Option<&'a str>,
     pub last_modified: Option<&'a str>,
     pub rate_remaining: Option<i64>,
     pub rate_reset: Option<i64>,
+    pub gql_cost: Option<i64>,
     pub cache_hit: bool,
     pub duration_ms: Option<i64>,
 }
@@ -346,19 +363,55 @@ pub struct CallLogEntry<'a> {
 pub fn log_call(conn: &Connection, entry: &CallLogEntry) -> Result<()> {
     conn.execute(
         "INSERT INTO call_log
-         (endpoint, method, status_code, etag, last_modified, rate_remaining, rate_reset, cache_hit, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (endpoint, api_type, method, status_code, etag, last_modified,
+          rate_remaining, rate_reset, gql_cost, cache_hit, duration_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             entry.endpoint,
+            entry.api_type,
             entry.method,
             entry.status_code.map(|c| c as i64),
             entry.etag,
             entry.last_modified,
             entry.rate_remaining,
             entry.rate_reset,
+            entry.gql_cost,
             entry.cache_hit as i64,
             entry.duration_ms,
         ],
+    )?;
+    Ok(())
+}
+
+// ---- change_log --------------------------------------------------------
+
+pub enum ChangeEvent {
+    Inserted,
+    Updated,
+}
+
+impl ChangeEvent {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ChangeEvent::Inserted => "inserted",
+            ChangeEvent::Updated => "updated",
+        }
+    }
+}
+
+pub fn log_change(
+    conn: &Connection,
+    entity_type: &str,
+    entity_id: i64,
+    event: ChangeEvent,
+    repo_slug: Option<&str>,
+    payload: Option<&serde_json::Value>,
+) -> Result<()> {
+    let payload_str = payload.map(|p| serde_json::to_string(p)).transpose()?;
+    conn.execute(
+        "INSERT INTO change_log (entity_type, entity_id, event, repo_slug, payload_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![entity_type, entity_id, event.as_str(), repo_slug, payload_str],
     )?;
     Ok(())
 }
@@ -434,12 +487,14 @@ mod tests {
             &conn,
             &CallLogEntry {
                 endpoint: "/repos/o/n/pulls",
+                api_type: "rest",
                 method: "GET",
                 status_code: Some(200),
                 etag: Some("\"xyz\""),
                 last_modified: None,
                 rate_remaining: Some(4999),
                 rate_reset: Some(1700000000),
+                gql_cost: None,
                 cache_hit: false,
                 duration_ms: Some(142),
             },
@@ -472,5 +527,55 @@ mod tests {
              SELECT * FROM v_rate_limit LIMIT 1;",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn change_log_insert() {
+        let conn = open_in_memory().unwrap();
+        let repo_id = upsert_repo(&conn, "o", "n", "main").unwrap();
+        log_change(&conn, "pull_request", repo_id, ChangeEvent::Inserted, Some("o/n"), None).unwrap();
+        log_change(&conn, "pull_request", repo_id, ChangeEvent::Updated, Some("o/n"), None).unwrap();
+
+        let rows: Vec<(String, String)> = {
+            let mut stmt = conn.prepare("SELECT entity_type, event FROM change_log ORDER BY id").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(rows, vec![
+            ("pull_request".into(), "inserted".into()),
+            ("pull_request".into(), "updated".into()),
+        ]);
+    }
+
+    #[test]
+    fn change_log_tail_pattern() {
+        let conn = open_in_memory().unwrap();
+        log_change(&conn, "notification", 1, ChangeEvent::Inserted, None, None).unwrap();
+        log_change(&conn, "notification", 2, ChangeEvent::Inserted, None, None).unwrap();
+        log_change(&conn, "notification", 3, ChangeEvent::Updated, None, None).unwrap();
+
+        let ids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT entity_id FROM change_log WHERE id > 1 ORDER BY id").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    fn change_log_with_payload() {
+        let conn = open_in_memory().unwrap();
+        let payload = serde_json::json!({ "number": 42, "title": "My PR" });
+        log_change(&conn, "pull_request", 42, ChangeEvent::Inserted, Some("o/n"), Some(&payload)).unwrap();
+
+        let stored: Option<String> = conn
+            .query_row("SELECT payload_json FROM change_log WHERE entity_id=42", [], |r| r.get(0))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&stored.unwrap()).unwrap();
+        assert_eq!(v["number"], 42);
     }
 }

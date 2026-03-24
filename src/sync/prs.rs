@@ -1,13 +1,14 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
+use crate::db::{log_change, ChangeEvent};
 use crate::gh::GhClient;
 
 
 /// Exposed for tests in query modules.
 #[cfg(test)]
 pub fn upsert_pr_for_test(conn: &Connection, repo_id: i64, pr: &serde_json::Value) -> Result<()> {
-    upsert_pr(conn, repo_id, pr)
+    upsert_pr(conn, repo_id, "test/repo", pr)
 }
 
 pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &str) -> Result<()> {
@@ -60,15 +61,16 @@ pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &
         }
     };
 
+    let slug = format!("{owner}/{name}");
     for pr in nodes {
-        upsert_pr(conn, repo_id, pr)?;
+        upsert_pr(conn, repo_id, &slug, pr)?;
     }
 
     tracing::info!(repo = %format!("{owner}/{name}"), count = nodes.len(), "PRs synced");
     Ok(())
 }
 
-fn upsert_pr(conn: &Connection, repo_id: i64, pr: &serde_json::Value) -> Result<()> {
+fn upsert_pr(conn: &Connection, repo_id: i64, repo_slug: &str, pr: &serde_json::Value) -> Result<()> {
     let number = pr["number"].as_i64().unwrap_or(0);
     let raw_json = serde_json::to_string(pr)?;
 
@@ -131,6 +133,14 @@ fn upsert_pr(conn: &Connection, repo_id: i64, pr: &serde_json::Value) -> Result<
         params![repo_id, number],
         |r| r.get(0),
     )?;
+
+    // Detect insert vs update: rowid changes on true insert, stays on conflict-update
+    let event = if conn.last_insert_rowid() == pr_id {
+        ChangeEvent::Inserted
+    } else {
+        ChangeEvent::Updated
+    };
+    log_change(conn, "pull_request", pr_id, event, Some(repo_slug), None)?;
 
     // Reviews
     if let Some(reviews) = pr["reviews"]["nodes"].as_array() {
@@ -253,7 +263,7 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let repo_id = db::upsert_repo(&conn, "o", "n", "main").unwrap();
 
-        upsert_pr(&conn, repo_id, &make_pr(1, "OPEN", "First")).unwrap();
+        upsert_pr(&conn, repo_id, "o/n", &make_pr(1, "OPEN", "First")).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pull_request", [], |r| r.get(0))
@@ -261,7 +271,7 @@ mod tests {
         assert_eq!(count, 1);
 
         // Update title via upsert
-        upsert_pr(&conn, repo_id, &make_pr(1, "OPEN", "Updated")).unwrap();
+        upsert_pr(&conn, repo_id, "o/n", &make_pr(1, "OPEN", "Updated")).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pull_request", [], |r| r.get(0))
             .unwrap();
@@ -278,7 +288,7 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let repo_id = db::upsert_repo(&conn, "o", "n", "main").unwrap();
 
-        upsert_pr(&conn, repo_id, &make_pr(1, "MERGED", "x")).unwrap();
+        upsert_pr(&conn, repo_id, "o/n", &make_pr(1, "MERGED", "x")).unwrap();
         let state: String = conn
             .query_row("SELECT state FROM pull_request WHERE number=1", [], |r| r.get(0))
             .unwrap();
@@ -294,7 +304,7 @@ mod tests {
         pr["reviews"]["nodes"] = serde_json::json!([
             { "databaseId": 101, "author": { "login": "bob" }, "state": "APPROVED", "body": "", "submittedAt": "2026-01-01T00:00:00Z" }
         ]);
-        upsert_pr(&conn, repo_id, &pr).unwrap();
+        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_review", [], |r| r.get(0))
@@ -317,7 +327,7 @@ mod tests {
             { "name": "bug", "color": "red" },
             { "name": "urgent", "color": "orange" }
         ]);
-        upsert_pr(&conn, repo_id, &pr).unwrap();
+        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_label", [], |r| r.get(0))
@@ -326,7 +336,7 @@ mod tests {
 
         // Re-sync with one label removed
         pr["labels"]["nodes"] = serde_json::json!([{ "name": "bug", "color": "red" }]);
-        upsert_pr(&conn, repo_id, &pr).unwrap();
+        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_label", [], |r| r.get(0))
@@ -352,7 +362,7 @@ mod tests {
                 }
             }
         }]);
-        upsert_pr(&conn, repo_id, &pr).unwrap();
+        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_status_check", [], |r| r.get(0))

@@ -2,8 +2,9 @@ mod config;
 mod db;
 mod gh;
 mod output;
-mod sync;
 mod query;
+mod serve;
+mod sync;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -55,6 +56,12 @@ enum Cmd {
     Query {
         #[command(subcommand)]
         sub: query::QueryCmd,
+    },
+    /// Broadcast change_log events to Unix socket subscribers
+    Serve {
+        /// Unix socket path (default: $XDG_RUNTIME_DIR/ghcache.sock or /tmp/ghcache.sock)
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
     },
     /// Checkout a branch into staging_folder
     Checkout {
@@ -108,6 +115,11 @@ fn main() -> Result<()> {
         Cmd::Query { sub } => {
             let conn = db::open(&cfg.db_path)?;
             query::run(&conn, sub)
+        }
+        Cmd::Serve { socket } => {
+            let conn = db::open(&cfg.db_path)?;
+            let path = socket.unwrap_or_else(serve::default_socket_path);
+            serve::run(&conn, &path)
         }
         Cmd::Checkout { repo, branch } => {
             anyhow::bail!("checkout not yet implemented: {repo}/{branch}");

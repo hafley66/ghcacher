@@ -143,12 +143,14 @@ impl GhClient {
             conn,
             &db::CallLogEntry {
                 endpoint: req.endpoint,
+                api_type: "rest",
                 method: req.method,
                 status_code: Some(status),
                 etag: resp.etag(),
                 last_modified: resp.last_modified(),
                 rate_remaining: resp.rate_remaining(),
                 rate_reset: resp.rate_reset(),
+                gql_cost: None,
                 cache_hit: resp.is_not_modified(),
                 duration_ms: Some(duration_ms as i64),
             },
@@ -166,10 +168,14 @@ impl GhClient {
         Ok(resp)
     }
 
+    /// Run a GraphQL query. Automatically injects `rateLimit { cost remaining resetAt }`
+    /// so we can track the separate GraphQL point pool in call_log.
     pub fn graphql(&self, conn: &rusqlite::Connection, query: &str) -> Result<serde_json::Value> {
+        let instrumented = inject_rate_limit(query);
+
         let mut cmd = Command::new(&self.binary);
-        cmd.arg("api").arg("graphql").arg("--include").arg("-f")
-            .arg(format!("query={}", query));
+        cmd.arg("api").arg("graphql").arg("--include")
+            .arg("-f").arg(format!("query={}", instrumented));
 
         let t = Instant::now();
         let output = cmd.output().context("spawning gh for graphql")?;
@@ -189,16 +195,26 @@ impl GhClient {
             bail!("GraphQL errors: {}", errors);
         }
 
+        // Pull rate limit info from the response body (separate GraphQL point pool).
+        let gql_cost     = body["data"]["rateLimit"]["cost"].as_i64();
+        let gql_remaining = body["data"]["rateLimit"]["remaining"].as_i64();
+        // resetAt is an ISO timestamp; also available via header
+        let header_remaining = headers.get("x-ratelimit-remaining").and_then(|v| v.parse().ok());
+        let header_reset     = headers.get("x-ratelimit-reset").and_then(|v| v.parse().ok());
+
         db::log_call(
             conn,
             &db::CallLogEntry {
                 endpoint: "graphql",
+                api_type: "graphql",
                 method: "POST",
                 status_code: Some(status),
-                etag: headers.get("etag").map(|s| s.as_str()),
+                etag: None,
                 last_modified: None,
-                rate_remaining: headers.get("x-ratelimit-remaining").and_then(|v| v.parse().ok()),
-                rate_reset: headers.get("x-ratelimit-reset").and_then(|v| v.parse().ok()),
+                // Prefer body-level remaining (GraphQL pool) over header (may reflect REST pool)
+                rate_remaining: gql_remaining.or(header_remaining),
+                rate_reset: header_reset,
+                gql_cost,
                 cache_hit: false,
                 duration_ms: Some(duration_ms as i64),
             },
@@ -240,6 +256,22 @@ fn parse_response(raw: &str) -> Result<(u16, HashMap<String, String>, &str)> {
     }
 
     Ok((status, headers, body))
+}
+
+/// Inject `rateLimit { cost remaining resetAt }` into a GraphQL query so we
+/// can track the separate GraphQL point pool. Looks for the last `}` and inserts before it.
+fn inject_rate_limit(query: &str) -> String {
+    let trimmed = query.trim_end();
+    if trimmed.contains("rateLimit") {
+        return query.to_owned(); // caller already added it
+    }
+    if let Some(pos) = trimmed.rfind('}') {
+        let mut out = trimmed.to_owned();
+        out.insert_str(pos, "\n  rateLimit { cost remaining resetAt }\n");
+        out
+    } else {
+        query.to_owned()
+    }
 }
 
 /// `gh api --paginate` streams multiple JSON arrays; concatenate into one.
@@ -323,10 +355,33 @@ mod tests {
 
     #[test]
     fn parse_picks_last_http_block_for_paginate() {
-        // Simulate two pages concatenated by --paginate --include
         let raw = "HTTP/2 200\r\netag: \"first\"\r\n\r\n[{\"id\":1}]\nHTTP/2 200\r\netag: \"second\"\r\n\r\n[{\"id\":2}]";
         let (status, headers, _) = parse_response(raw).unwrap();
         assert_eq!(status, 200);
         assert_eq!(headers.get("etag").map(|s| s.as_str()), Some("\"second\""));
+    }
+
+    #[test]
+    fn inject_rate_limit_adds_selection() {
+        let q = "{ repository(owner: \"o\", name: \"n\") { name } }";
+        let out = inject_rate_limit(q);
+        assert!(out.contains("rateLimit"));
+        assert!(out.contains("cost"));
+        assert!(out.contains("remaining"));
+    }
+
+    #[test]
+    fn inject_rate_limit_idempotent() {
+        let q = "{ rateLimit { cost remaining resetAt } repository { name } }";
+        let out = inject_rate_limit(q);
+        // Should not double-inject
+        assert_eq!(out.matches("rateLimit").count(), 1);
+    }
+
+    #[test]
+    fn inject_rate_limit_no_closing_brace_is_noop() {
+        let q = "no braces here";
+        let out = inject_rate_limit(q);
+        assert_eq!(out, q);
     }
 }
