@@ -2,9 +2,12 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 
 use crate::db::{self, ChangeEvent};
-use crate::gh::{GhClient, GhRequest};
+use crate::gh::{GitHubClient, GhRequest};
 
-pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &str) -> Result<()> {
+/// Sync repo events. Returns PR numbers that were touched by newly seen
+/// PullRequestEvent or PullRequestReviewEvent entries -- callers use this
+/// to drive targeted PR syncs instead of full sweeps.
+pub fn sync(conn: &Connection, gh: &dyn GitHubClient, repo_id: i64, owner: &str, name: &str) -> Result<Vec<i64>> {
     let endpoint = format!("/repos/{owner}/{name}/events");
     let poll = db::get_poll_state(conn, &endpoint)?;
 
@@ -17,21 +20,26 @@ pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &
 
     if resp.is_not_modified() {
         tracing::debug!(repo = %format!("{owner}/{name}"), "events: 304 not modified");
-        return Ok(());
+        return Ok(vec![]);
     }
 
     let events = match resp.body.as_array() {
         Some(a) => a,
-        None => return Ok(()),
+        None => return Ok(vec![]),
     };
 
+    let slug = format!("{owner}/{name}");
     let mut inserted = 0usize;
+    let mut dirty_prs: Vec<i64> = vec![];
+
     for ev in events {
         let gh_id = match ev["id"].as_str() {
             Some(id) => id,
             None => continue,
         };
-        let payload = serde_json::to_string(ev.get("payload").unwrap_or(&serde_json::Value::Null))?;
+        let ev_type = ev["type"].as_str().unwrap_or("");
+        let payload = ev.get("payload").unwrap_or(&serde_json::Value::Null);
+        let payload_str = serde_json::to_string(payload)?;
 
         let n = conn.execute(
             "INSERT OR IGNORE INTO repo_event (repo_id, gh_id, type, actor, payload_json, created_at)
@@ -39,9 +47,9 @@ pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &
             params![
                 repo_id,
                 gh_id,
-                ev["type"].as_str().unwrap_or(""),
+                ev_type,
                 ev["actor"]["login"].as_str(),
-                payload,
+                payload_str,
                 ev["created_at"].as_str().unwrap_or(""),
             ],
         )?;
@@ -51,14 +59,25 @@ pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &
                 params![repo_id, gh_id],
                 |r| r.get(0),
             )?;
-            let slug = format!("{owner}/{name}");
             db::log_change(conn, "repo_event", row_id, ChangeEvent::Inserted, Some(&slug), None)?;
+
+            if let Some(pr_num) = pr_number_from_event(ev_type, payload) {
+                dirty_prs.push(pr_num);
+            }
         }
         inserted += n;
     }
 
-    tracing::info!(repo = %format!("{owner}/{name}"), inserted, total = events.len(), "events synced");
-    Ok(())
+    tracing::info!(repo = %slug, inserted, total = events.len(), dirty_prs = dirty_prs.len(), "events synced");
+    Ok(dirty_prs)
+}
+
+fn pr_number_from_event(ev_type: &str, payload: &serde_json::Value) -> Option<i64> {
+    match ev_type {
+        "PullRequestEvent" => payload["number"].as_i64(),
+        "PullRequestReviewEvent" => payload["pull_request"]["number"].as_i64(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

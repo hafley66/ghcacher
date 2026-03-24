@@ -5,6 +5,12 @@ use std::time::Instant;
 
 use crate::db;
 
+pub trait GitHubClient {
+    fn call(&self, conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse>;
+    fn graphql(&self, conn: &rusqlite::Connection, endpoint: &str, query: &str) -> Result<serde_json::Value>;
+    fn throttle_if_needed(&self, conn: &rusqlite::Connection, api_type: &str) -> Result<i64>;
+}
+
 pub struct GhClient {
     pub binary: String,
 }
@@ -96,10 +102,10 @@ impl GhClient {
     pub fn new(binary: impl Into<String>) -> Self {
         GhClient { binary: binary.into() }
     }
+}
 
-    /// Check the most recent rate limit state from call_log and sleep if needed.
-    /// Returns the current remaining count for the given api_type.
-    pub fn throttle_if_needed(&self, conn: &rusqlite::Connection, api_type: &str) -> Result<i64> {
+impl GitHubClient for GhClient {
+    fn throttle_if_needed(&self, conn: &rusqlite::Connection, api_type: &str) -> Result<i64> {
         let (warn, stop) = if api_type == "graphql" {
             (GQL_WARN_THRESHOLD, GQL_STOP_THRESHOLD)
         } else {
@@ -139,7 +145,7 @@ impl GhClient {
         Ok(remaining)
     }
 
-    pub fn call(&self, conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse> {
+    fn call(&self, conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse> {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("api").arg("--include");
 
@@ -220,7 +226,8 @@ impl GhClient {
 
     /// Run a GraphQL query. Automatically injects `rateLimit { cost remaining resetAt }`
     /// so we can track the separate GraphQL point pool in call_log.
-    pub fn graphql(&self, conn: &rusqlite::Connection, query: &str) -> Result<serde_json::Value> {
+    /// `endpoint` is used as the call_log label (e.g. "graphql:prs:full/owner/name").
+    fn graphql(&self, conn: &rusqlite::Connection, endpoint: &str, query: &str) -> Result<serde_json::Value> {
         let instrumented = inject_rate_limit(query);
 
         let mut cmd = Command::new(&self.binary);
@@ -255,7 +262,7 @@ impl GhClient {
         db::log_call(
             conn,
             &db::CallLogEntry {
-                endpoint: "graphql",
+                endpoint,
                 api_type: "graphql",
                 method: "POST",
                 status_code: Some(status),
@@ -338,6 +345,71 @@ fn parse_paginated_body(body: &str) -> Result<serde_json::Value> {
         }
     }
     Ok(serde_json::Value::Array(combined))
+}
+
+/// Test double for GhClient. Records all calls and returns queued responses.
+#[cfg(test)]
+pub(crate) struct MockGhClient {
+    pub graphql_calls: std::cell::RefCell<Vec<(String, String)>>,
+    pub rest_calls: std::cell::RefCell<Vec<String>>,
+    graphql_queue: std::cell::RefCell<std::collections::VecDeque<serde_json::Value>>,
+    rest_queue: std::cell::RefCell<std::collections::VecDeque<(u16, serde_json::Value)>>,
+}
+
+#[cfg(test)]
+impl MockGhClient {
+    pub fn new() -> Self {
+        MockGhClient {
+            graphql_calls: std::cell::RefCell::new(vec![]),
+            rest_calls: std::cell::RefCell::new(vec![]),
+            graphql_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            rest_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub fn push_graphql(&self, v: serde_json::Value) {
+        self.graphql_queue.borrow_mut().push_back(v);
+    }
+
+    pub fn push_rest(&self, v: serde_json::Value) {
+        self.rest_queue.borrow_mut().push_back((200, v));
+    }
+
+    pub fn push_rest_304(&self) {
+        self.rest_queue.borrow_mut().push_back((304, serde_json::Value::Null));
+    }
+
+    pub fn graphql_call_count(&self) -> usize {
+        self.graphql_calls.borrow().len()
+    }
+
+    pub fn rest_call_count(&self) -> usize {
+        self.rest_calls.borrow().len()
+    }
+}
+
+#[cfg(test)]
+impl GitHubClient for MockGhClient {
+    fn call(&self, _conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse> {
+        self.rest_calls.borrow_mut().push(req.endpoint.to_owned());
+        let (status, body) = self.rest_queue.borrow_mut().pop_front()
+            .unwrap_or((200, serde_json::json!([])));
+        Ok(GhResponse {
+            status,
+            headers: HashMap::new(),
+            body,
+            duration_ms: 0,
+        })
+    }
+
+    fn graphql(&self, _conn: &rusqlite::Connection, endpoint: &str, query: &str) -> Result<serde_json::Value> {
+        self.graphql_calls.borrow_mut().push((endpoint.to_owned(), query.to_owned()));
+        Ok(self.graphql_queue.borrow_mut().pop_front().unwrap_or(serde_json::json!({})))
+    }
+
+    fn throttle_if_needed(&self, _conn: &rusqlite::Connection, _api_type: &str) -> Result<i64> {
+        Ok(i64::MAX)
+    }
 }
 
 #[cfg(test)]

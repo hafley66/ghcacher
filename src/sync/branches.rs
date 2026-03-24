@@ -2,11 +2,11 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 
 use crate::db::{self, ChangeEvent};
-use crate::gh::{GhClient, GhRequest};
+use crate::gh::{GitHubClient, GhRequest};
 
 pub fn sync(
     conn: &Connection,
-    gh: &GhClient,
+    gh: &dyn GitHubClient,
     repo_id: i64,
     owner: &str,
     name: &str,

@@ -3,11 +3,11 @@ use rusqlite::{Connection, params};
 
 use crate::config::ResolvedConfig;
 use crate::db::{self, ChangeEvent};
-use crate::gh::{GhClient, GhRequest};
+use crate::gh::{GitHubClient, GhRequest};
 
 const ENDPOINT: &str = "/notifications";
 
-pub fn sync(conn: &Connection, gh: &GhClient, cfg: &ResolvedConfig) -> Result<()> {
+pub fn sync(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> Result<()> {
     let poll = db::get_poll_state(conn, ENDPOINT)?;
 
     let mut req = GhRequest::get(ENDPOINT);

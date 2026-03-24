@@ -2,7 +2,35 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 
 use crate::db::{log_change, ChangeEvent};
-use crate::gh::GhClient;
+use crate::gh::GitHubClient;
+
+const PR_FIELDS: &str = r#"number title state isDraft body
+              headRefName headRefOid baseRefName mergeable
+              additions deletions changedFiles
+              createdAt updatedAt mergedAt closedAt
+              databaseId id
+              author { login }
+              reviews(last: 20) {
+                nodes { databaseId author { login } state body submittedAt }
+              }
+              labels(first: 10) {
+                nodes { name color }
+              }
+              commits(last: 1) {
+                nodes {
+                  commit {
+                    statusCheckRollup {
+                      contexts(first: 50) {
+                        nodes {
+                          __typename
+                          ... on StatusContext { context state targetUrl description }
+                          ... on CheckRun { name conclusion detailsUrl }
+                        }
+                      }
+                    }
+                  }
+                }
+              }"#;
 
 
 /// Exposed for tests in query modules.
@@ -11,48 +39,20 @@ pub fn upsert_pr_for_test(conn: &Connection, repo_id: i64, pr: &serde_json::Valu
     upsert_pr(conn, repo_id, "test/repo", pr)
 }
 
-pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &str) -> Result<()> {
-    tracing::debug!(repo = %format!("{owner}/{name}"), "syncing PRs via GraphQL");
+pub fn sync(conn: &Connection, gh: &dyn GitHubClient, repo_id: i64, owner: &str, name: &str) -> Result<()> {
+    tracing::debug!(repo = %format!("{owner}/{name}"), "syncing PRs via GraphQL (full)");
     gh.throttle_if_needed(conn, "graphql")?;
 
-    // Build the query with variables inlined (gh api graphql -f doesn't support $vars easily)
     let inlined = format!(
         r#"{{ repository(owner: "{owner}", name: "{name}") {{
           pullRequests(first: 100, states: OPEN, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
-            nodes {{
-              number title state isDraft body
-              headRefName headRefOid baseRefName mergeable
-              additions deletions changedFiles
-              createdAt updatedAt mergedAt closedAt
-              databaseId id
-              author {{ login }}
-              reviews(last: 20) {{
-                nodes {{ databaseId author {{ login }} state body submittedAt }}
-              }}
-              labels(first: 10) {{
-                nodes {{ name color }}
-              }}
-              commits(last: 1) {{
-                nodes {{
-                  commit {{
-                    statusCheckRollup {{
-                      contexts(first: 50) {{
-                        nodes {{
-                          __typename
-                          ... on StatusContext {{ context state targetUrl description }}
-                          ... on CheckRun {{ name conclusion detailsUrl }}
-                        }}
-                      }}
-                    }}
-                  }}
-                }}
-              }}
-            }}
+            nodes {{ {PR_FIELDS} }}
           }}
         }} }}"#
     );
 
-    let data = gh.graphql(conn, &inlined)?;
+    let endpoint = format!("graphql:prs:full/{owner}/{name}");
+    let data = gh.graphql(conn, &endpoint, &inlined)?;
     let nodes = &data["repository"]["pullRequests"]["nodes"];
     let nodes = match nodes.as_array() {
         Some(a) => a,
@@ -68,6 +68,51 @@ pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &
     }
 
     tracing::info!(repo = %format!("{owner}/{name}"), count = nodes.len(), "PRs synced");
+    Ok(())
+}
+
+/// Fetch specific PRs by number in one GraphQL round trip using field aliases.
+/// Called when events hint that particular PRs changed.
+pub fn sync_targeted(
+    conn: &Connection,
+    gh: &dyn GitHubClient,
+    repo_id: i64,
+    owner: &str,
+    name: &str,
+    numbers: &[i64],
+) -> Result<()> {
+    if numbers.is_empty() {
+        return Ok(());
+    }
+    gh.throttle_if_needed(conn, "graphql")?;
+
+    let aliases: String = numbers
+        .iter()
+        .map(|n| format!("  pr_{n}: pullRequest(number: {n}) {{\n    {PR_FIELDS}\n  }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let query = format!(
+        r#"{{ repository(owner: "{owner}", name: "{name}") {{
+{aliases}
+        }} }}"#
+    );
+
+    let endpoint = format!("graphql:prs:targeted/{owner}/{name}");
+    let data = gh.graphql(conn, &endpoint, &query)?;
+
+    let slug = format!("{owner}/{name}");
+    let repo_data = &data["repository"];
+    for n in numbers {
+        let key = format!("pr_{n}");
+        if let Some(pr) = repo_data.get(&key) {
+            if !pr.is_null() {
+                upsert_pr(conn, repo_id, &slug, pr)?;
+            }
+        }
+    }
+
+    tracing::info!(repo = %slug, count = numbers.len(), "PRs synced (targeted)");
     Ok(())
 }
 

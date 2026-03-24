@@ -102,7 +102,7 @@ fn main() -> Result<()> {
             let conn = db::open(&cfg.db_path)?;
             let gh = gh::GhClient::new(&cfg.gh_binary);
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
-            sync::run(&conn, &gh, &cfg, filter)
+            sync::run(&conn, &gh, &cfg, filter, true)
         }
         Cmd::Watch { daemon } => {
             if daemon {
