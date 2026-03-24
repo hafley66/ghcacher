@@ -84,9 +84,59 @@ impl GhResponse {
     }
 }
 
+/// Thresholds for rate-limit back-off.
+/// Below WARN_THRESHOLD: sleep extra between calls.
+/// Below STOP_THRESHOLD: sleep until reset before proceeding.
+const REST_WARN_THRESHOLD: i64 = 500;
+const REST_STOP_THRESHOLD: i64 = 50;
+const GQL_WARN_THRESHOLD: i64 = 500;
+const GQL_STOP_THRESHOLD: i64 = 50;
+
 impl GhClient {
     pub fn new(binary: impl Into<String>) -> Self {
         GhClient { binary: binary.into() }
+    }
+
+    /// Check the most recent rate limit state from call_log and sleep if needed.
+    /// Returns the current remaining count for the given api_type.
+    pub fn throttle_if_needed(&self, conn: &rusqlite::Connection, api_type: &str) -> Result<i64> {
+        let (warn, stop) = if api_type == "graphql" {
+            (GQL_WARN_THRESHOLD, GQL_STOP_THRESHOLD)
+        } else {
+            (REST_WARN_THRESHOLD, REST_STOP_THRESHOLD)
+        };
+
+        let row: Option<(i64, i64)> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT rate_remaining, COALESCE(rate_reset, 0)
+                 FROM call_log WHERE api_type = ?1 AND rate_remaining IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![api_type])?;
+            rows.next()?.map(|r| (r.get_unwrap(0), r.get_unwrap(1)))
+        };
+
+        let (remaining, reset_ts) = match row {
+            None => return Ok(i64::MAX), // no data yet, proceed
+            Some(r) => r,
+        };
+
+        if remaining <= stop {
+            let now = chrono::Utc::now().timestamp();
+            let wait = (reset_ts - now).max(1);
+            tracing::warn!(
+                api_type,
+                remaining,
+                wait_seconds = wait,
+                "rate limit critical -- sleeping until reset"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(wait as u64));
+        } else if remaining <= warn {
+            tracing::warn!(api_type, remaining, "rate limit low -- sleeping 10s");
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+
+        Ok(remaining)
     }
 
     pub fn call(&self, conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse> {
@@ -383,5 +433,58 @@ mod tests {
         let q = "no braces here";
         let out = inject_rate_limit(q);
         assert_eq!(out, q);
+    }
+
+    #[test]
+    fn throttle_no_data_returns_max() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let client = GhClient::new("gh");
+        let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
+        assert_eq!(remaining, i64::MAX);
+    }
+
+    #[test]
+    fn throttle_healthy_rate_limit_no_sleep() {
+        let conn = crate::db::open_in_memory().unwrap();
+        // Log a call with plenty of remaining
+        crate::db::log_call(&conn, &crate::db::CallLogEntry {
+            endpoint: "/repos/o/n/events",
+            api_type: "rest",
+            method: "GET",
+            status_code: Some(200),
+            etag: None,
+            last_modified: None,
+            rate_remaining: Some(4800),
+            rate_reset: Some(chrono::Utc::now().timestamp() + 3600),
+            gql_cost: None,
+            cache_hit: false,
+            duration_ms: Some(50),
+        }).unwrap();
+        let client = GhClient::new("gh");
+        // Should return immediately (4800 > 500 warn threshold)
+        let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
+        assert_eq!(remaining, 4800);
+    }
+
+    #[test]
+    fn throttle_reads_correct_api_type() {
+        let conn = crate::db::open_in_memory().unwrap();
+        // REST pool healthy, GraphQL pool empty -- throttle("graphql") returns MAX
+        crate::db::log_call(&conn, &crate::db::CallLogEntry {
+            endpoint: "/repos/o/n/events",
+            api_type: "rest",
+            method: "GET",
+            status_code: Some(200),
+            etag: None,
+            last_modified: None,
+            rate_remaining: Some(100),
+            rate_reset: Some(chrono::Utc::now().timestamp() + 3600),
+            gql_cost: None,
+            cache_hit: false,
+            duration_ms: Some(50),
+        }).unwrap();
+        let client = GhClient::new("gh");
+        let remaining = client.throttle_if_needed(&conn, "graphql").unwrap();
+        assert_eq!(remaining, i64::MAX); // no graphql calls yet
     }
 }

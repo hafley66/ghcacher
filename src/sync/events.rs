@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-use crate::db;
+use crate::db::{self, ChangeEvent};
 use crate::gh::{GhClient, GhRequest};
 
 pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &str) -> Result<()> {
@@ -45,6 +45,15 @@ pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &
                 ev["created_at"].as_str().unwrap_or(""),
             ],
         )?;
+        if n > 0 {
+            let row_id: i64 = conn.query_row(
+                "SELECT id FROM repo_event WHERE repo_id=?1 AND gh_id=?2",
+                params![repo_id, gh_id],
+                |r| r.get(0),
+            )?;
+            let slug = format!("{owner}/{name}");
+            db::log_change(conn, "repo_event", row_id, ChangeEvent::Inserted, Some(&slug), None)?;
+        }
         inserted += n;
     }
 

@@ -13,6 +13,7 @@ pub fn upsert_pr_for_test(conn: &Connection, repo_id: i64, pr: &serde_json::Valu
 
 pub fn sync(conn: &Connection, gh: &GhClient, repo_id: i64, owner: &str, name: &str) -> Result<()> {
     tracing::debug!(repo = %format!("{owner}/{name}"), "syncing PRs via GraphQL");
+    gh.throttle_if_needed(conn, "graphql")?;
 
     // Build the query with variables inlined (gh api graphql -f doesn't support $vars easily)
     let inlined = format!(

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-use crate::db;
+use crate::db::{self, ChangeEvent};
 use crate::gh::{GhClient, GhRequest};
 
 pub fn sync(
@@ -54,6 +54,19 @@ pub fn sync(
                  updated_at = excluded.updated_at",
             params![repo_id, branch_name, sha, now],
         )?;
+
+        let branch_id: i64 = conn.query_row(
+            "SELECT id FROM branch WHERE repo_id=?1 AND name=?2",
+            params![repo_id, branch_name],
+            |r| r.get(0),
+        )?;
+        let event = if conn.last_insert_rowid() == branch_id {
+            ChangeEvent::Inserted
+        } else {
+            ChangeEvent::Updated
+        };
+        let slug = format!("{owner}/{name}");
+        db::log_change(conn, "branch", branch_id, event, Some(&slug), None)?;
         synced += 1;
     }
 

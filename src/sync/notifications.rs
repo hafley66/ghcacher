@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::{Connection, params};
 
 use crate::config::ResolvedConfig;
-use crate::db;
+use crate::db::{self, ChangeEvent};
 use crate::gh::{GhClient, GhRequest};
 
 const ENDPOINT: &str = "/notifications";
@@ -83,6 +83,21 @@ fn upsert_notification(conn: &Connection, thread: &serde_json::Value) -> Result<
             thread["last_read_at"].as_str(),
         ],
     )?;
+
+    let notif_id: i64 = conn.query_row(
+        "SELECT id FROM notification WHERE gh_id = ?1",
+        params![gh_id],
+        |r| r.get(0),
+    )?;
+    let event = if conn.last_insert_rowid() == notif_id {
+        ChangeEvent::Inserted
+    } else {
+        ChangeEvent::Updated
+    };
+    let owner = thread["repository"]["owner"]["login"].as_str().unwrap_or("");
+    let name = thread["repository"]["name"].as_str().unwrap_or("");
+    let slug = if owner.is_empty() { None } else { Some(format!("{owner}/{name}")) };
+    db::log_change(conn, "notification", notif_id, event, slug.as_deref(), None)?;
 
     Ok(())
 }

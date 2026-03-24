@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    ".",
+    "ghcache-client",
+]
+resolver = "2"
+
 [package]
 name = "ghcache"
 version = "0.1.0"

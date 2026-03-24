@@ -46,6 +46,9 @@ pub fn run(conn: &Connection, gh: &GhClient, cfg: &ResolvedConfig, filter: SyncF
 
         tracing::info!(repo = %repo.slug(), "syncing");
 
+        // Back off if rate limit is low before starting this repo's calls
+        gh.throttle_if_needed(conn, "rest")?;
+
         let tx = conn.unchecked_transaction()?;
 
         let result = (|| -> Result<()> {
