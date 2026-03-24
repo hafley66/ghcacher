@@ -1,0 +1,22 @@
+# Build
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime / local
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Config overrides
+ghcache.toml
