@@ -1,9 +1,36 @@
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::process::Command;
 use std::time::Instant;
 
 use crate::db;
+
+#[derive(Serialize)]
+struct RateSummary {
+    ts: String,
+    rest_remaining: Option<i64>,
+    graphql_remaining: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct RestCallLine<'a> {
+    ts: String,
+    endpoint: &'a str,
+    status: u16,
+    rate_remaining: Option<i64>,
+    duration_ms: u64,
+}
+
+#[derive(Serialize)]
+struct GraphqlCallLine<'a> {
+    ts: String,
+    endpoint: &'a str,
+    status: u16,
+    rate_remaining: Option<i64>,
+    gql_cost: Option<i64>,
+    duration_ms: u64,
+}
 
 pub trait GitHubClient {
     fn call(&self, conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse>;
@@ -107,14 +134,12 @@ impl GhClient {
 
     fn emit_rate_log(&self, conn: &rusqlite::Connection) {
         if self.silent { return; }
-        let rest = latest_remaining(conn, "rest");
-        let graphql = latest_remaining(conn, "graphql");
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        println!("{}", serde_json::json!({
-            "ts": ts,
-            "gh_points_rest_remaining": rest,
-            "gh_points_graphql_remaining": graphql,
-        }));
+        println!("{}", serde_json::to_string(&RateSummary {
+            ts,
+            rest_remaining: latest_remaining(conn, "rest"),
+            graphql_remaining: latest_remaining(conn, "graphql"),
+        }).unwrap_or_default());
     }
 }
 
@@ -224,14 +249,13 @@ impl GitHubClient for GhClient {
         )?;
         if self.calls_to_stdout {
             let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            println!("{}", serde_json::json!({
-                "ts": ts,
-                "api_type": "rest",
-                "endpoint": req.endpoint,
-                "status": status,
-                "rate_remaining": resp.rate_remaining(),
-                "duration_ms": duration_ms,
-            }));
+            println!("{}", serde_json::to_string(&RestCallLine {
+                ts,
+                endpoint: req.endpoint,
+                status,
+                rate_remaining: resp.rate_remaining(),
+                duration_ms,
+            }).unwrap_or_default());
         }
         self.emit_rate_log(conn);
 
@@ -301,15 +325,14 @@ impl GitHubClient for GhClient {
         )?;
         if self.calls_to_stdout {
             let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            println!("{}", serde_json::json!({
-                "ts": ts,
-                "api_type": "graphql",
-                "endpoint": endpoint,
-                "status": status,
-                "rate_remaining": gql_remaining.or(header_remaining),
-                "gql_cost": gql_cost,
-                "duration_ms": duration_ms,
-            }));
+            println!("{}", serde_json::to_string(&GraphqlCallLine {
+                ts,
+                endpoint,
+                status,
+                rate_remaining: gql_remaining.or(header_remaining),
+                gql_cost,
+                duration_ms,
+            }).unwrap_or_default());
         }
         self.emit_rate_log(conn);
 

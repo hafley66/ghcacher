@@ -193,10 +193,10 @@ Two independent streams, both on stdout, both in JSON Lines format (one object p
 After every API call, the current pool sizes are emitted:
 
 ```json
-{"gh_points_graphql_remaining":4950,"gh_points_rest_remaining":4800,"ts":"2026-03-25T10:00:00Z"}
+{"ts":"2026-03-25T10:00:00Z","rest_remaining":4800,"graphql_remaining":4950}
 ```
 
-Both REST and GraphQL values are always shown together (latest recorded value for each pool).
+Both pools are always shown together (latest recorded value for each).
 
 ### Per-call detail (`--calls-to-stdout` enables)
 
@@ -204,12 +204,12 @@ Each individual API call emits its own line with the endpoint and cost:
 
 REST:
 ```json
-{"api_type":"rest","duration_ms":42,"endpoint":"/repos/myorg/backend/events","rate_remaining":4800,"status":200,"ts":"2026-03-25T10:00:00Z"}
+{"ts":"2026-03-25T10:00:00Z","endpoint":"/repos/myorg/backend/events","status":200,"rate_remaining":4800,"duration_ms":42}
 ```
 
 GraphQL:
 ```json
-{"api_type":"graphql","duration_ms":150,"endpoint":"graphql:prs:full/myorg/backend","gql_cost":1,"rate_remaining":4950,"status":200,"ts":"2026-03-25T10:00:00Z"}
+{"ts":"2026-03-25T10:00:00Z","endpoint":"graphql:prs:full/myorg/backend","status":200,"rate_remaining":4950,"gql_cost":1,"duration_ms":150}
 ```
 
 `gql_cost` is the GraphQL point cost reported by the GitHub API (null for REST calls).
