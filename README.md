@@ -6,10 +6,122 @@ GitHub data is synced into SQLite; local tools query SQLite directly -- no live 
 ## Quick start
 
 ```sh
+# Option A: guided TUI (requires ghcache-init -- see Setup below)
+ghcache setup
+
+# Option B: manual
 ghcache init          # write ghcache.toml template
-$EDITOR ghcache.toml  # add your repos
+$EDITOR ghcache.toml  # edit owner/repos
 ghcache sync          # full initial sync
 ghcache watch         # continuous polling loop
+```
+
+## Setup (guided TUI)
+
+`ghcache setup` runs an interactive terminal form and writes `ghcache.toml` for you.
+It requires the `ghcache-init` companion binary (Go + Charm huh):
+
+```sh
+cd init-form
+go build -o ghcache-init .
+# Put it next to the ghcache binary, or on PATH:
+cp ghcache-init /usr/local/bin/
+```
+
+Then:
+```sh
+ghcache setup          # launches the form, writes ghcache.toml, runs initial sync
+```
+
+To write the config somewhere other than `./ghcache.toml`:
+```sh
+ghcache --config ~/.config/ghcache/config.toml setup
+```
+
+## Demo (copy-paste)
+
+Replace `yourname` with your GitHub login (`gh api user --jq '.login'`).
+
+**1. Write a throw-away config**
+
+To sync every repo under your account (replace `yourname`):
+
+```sh
+cat > /tmp/ghcache-demo.toml << 'EOF'
+[global]
+db_path   = "/tmp/ghcache-demo.db"
+log_level = "warn"
+gh_binary = "gh"
+
+[[org]]
+owner         = "yourname"
+sync_prs      = true
+sync_events   = true
+sync_branches = ["main"]
+exclude       = []          # repo names to skip
+EOF
+```
+
+Or to target specific repos instead:
+
+```sh
+cat > /tmp/ghcache-demo.toml << 'EOF'
+[global]
+db_path   = "/tmp/ghcache-demo.db"
+log_level = "warn"
+gh_binary = "gh"
+
+[[repo]]
+owner          = "yourname"
+name           = "your-repo"
+default_branch = "main"
+sync_prs       = true
+sync_events    = true
+sync_branches  = ["main"]
+EOF
+```
+
+**2. First sync -- full sweep**
+
+```sh
+ghcache --config /tmp/ghcache-demo.toml sync
+```
+
+**3. Query the DB directly -- no API calls**
+
+```sh
+DB=/tmp/ghcache-demo.db
+
+# branches with SHAs
+sqlite3 $DB -column -header "
+  SELECT r.owner||'/'||r.name AS repo, b.name AS branch, substr(b.sha,1,8) AS sha
+  FROM branch b JOIN repo r ON r.id=b.repo_id;"
+
+# open PRs
+sqlite3 $DB -column -header "SELECT * FROM v_open_prs;"
+
+# recent events
+sqlite3 $DB -column -header "SELECT repo_slug, type, actor, created_at FROM v_recent_events LIMIT 10;"
+```
+
+**4. Second sync -- watch it be instant**
+
+```sh
+time ghcache --config /tmp/ghcache-demo.toml sync
+```
+
+**5. Confirm it was free (304 cache hits)**
+
+```sh
+sqlite3 $DB -column -header "
+  SELECT endpoint, status_code, cache_hit, duration_ms
+  FROM call_log ORDER BY id DESC LIMIT 15;"
+```
+
+**6. Clean up**
+
+```sh
+rm /tmp/ghcache-demo.toml /tmp/ghcache-demo.db
 ```
 
 ## Config file search order
@@ -24,11 +136,24 @@ ghcache watch         # continuous polling loop
 ```toml
 [global]
 db_path              = "~/.local/share/ghcache/gh.db"
-staging_folder       = "~/src/staging"   # required for checkout
+staging_folder       = "~/.local/share/ghcache/repos"  # git checkouts live here, next to the DB
 poll_interval_seconds = 60
 log_level            = "info"            # trace | debug | info | warn | error
 gh_binary            = "gh"
 
+# Sync every repo under a GitHub user or org account.
+# Discovered at sync time via the GitHub repos API (ETag-gated, usually a free 304).
+[[org]]
+owner                = "myorg"
+sync_prs             = true
+sync_notifications   = true
+sync_events          = true
+sync_branches        = ["main"]
+checkout_on_sync     = false
+poll_interval_seconds = 60
+exclude              = ["archived-repo", "scratch"]   # repo names to skip
+
+# Or target specific repos explicitly.
 [[repo]]
 owner                = "myorg"
 name                 = "backend"
@@ -40,6 +165,8 @@ sync_branches        = ["main", "staging", "release/*"]  # glob trailing * suppo
 checkout_on_sync     = false   # if true, watch loop runs checkout for sync_branches
 poll_interval_seconds = 30    # overrides global for this repo
 ```
+
+`[[org]]` and `[[repo]]` can coexist. Repos discovered via `[[org]]` that are also listed under `[[repo]]` will be synced twice (once with each config). Use `exclude` to avoid that.
 
 ## Commands
 

@@ -36,7 +36,13 @@ const PR_FIELDS: &str = r#"number title state isDraft body
 /// Exposed for tests in query modules.
 #[cfg(test)]
 pub fn upsert_pr_for_test(conn: &Connection, repo_id: i64, pr: &serde_json::Value) -> Result<()> {
-    upsert_pr(conn, repo_id, "test/repo", pr)
+    let number = pr["number"].as_i64().unwrap_or(0);
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pull_request WHERE repo_id=?1 AND number=?2)",
+        params![repo_id, number],
+        |r| r.get(0),
+    )?;
+    upsert_pr(conn, repo_id, "test/repo", pr, !exists)
 }
 
 pub fn sync(conn: &Connection, gh: &dyn GitHubClient, repo_id: i64, owner: &str, name: &str) -> Result<()> {
@@ -63,8 +69,22 @@ pub fn sync(conn: &Connection, gh: &dyn GitHubClient, repo_id: i64, owner: &str,
     };
 
     let slug = format!("{owner}/{name}");
+
+    // Preload existing PR numbers for this repo to avoid a SELECT per upsert.
+    let existing: std::collections::HashSet<i64> = {
+        use std::collections::HashSet;
+        let mut stmt = conn.prepare("SELECT number FROM pull_request WHERE repo_id=?1")?;
+        let mut set = HashSet::new();
+        let mut rows = stmt.query(params![repo_id])?;
+        while let Some(row) = rows.next()? {
+            set.insert(row.get::<_, i64>(0)?);
+        }
+        set
+    };
+
     for pr in nodes {
-        upsert_pr(conn, repo_id, &slug, pr)?;
+        let number = pr["number"].as_i64().unwrap_or(0);
+        upsert_pr(conn, repo_id, &slug, pr, !existing.contains(&number))?;
     }
 
     tracing::info!(repo = %format!("{owner}/{name}"), count = nodes.len(), "PRs synced");
@@ -102,12 +122,25 @@ pub fn sync_targeted(
     let data = gh.graphql(conn, &endpoint, &query)?;
 
     let slug = format!("{owner}/{name}");
+
+    // Preload existing PR numbers for this repo.
+    let existing: std::collections::HashSet<i64> = {
+        use std::collections::HashSet;
+        let mut stmt = conn.prepare("SELECT number FROM pull_request WHERE repo_id=?1")?;
+        let mut set = HashSet::new();
+        let mut rows = stmt.query(params![repo_id])?;
+        while let Some(row) = rows.next()? {
+            set.insert(row.get::<_, i64>(0)?);
+        }
+        set
+    };
+
     let repo_data = &data["repository"];
     for n in numbers {
         let key = format!("pr_{n}");
         if let Some(pr) = repo_data.get(&key) {
             if !pr.is_null() {
-                upsert_pr(conn, repo_id, &slug, pr)?;
+                upsert_pr(conn, repo_id, &slug, pr, !existing.contains(n))?;
             }
         }
     }
@@ -116,7 +149,7 @@ pub fn sync_targeted(
     Ok(())
 }
 
-fn upsert_pr(conn: &Connection, repo_id: i64, repo_slug: &str, pr: &serde_json::Value) -> Result<()> {
+fn upsert_pr(conn: &Connection, repo_id: i64, repo_slug: &str, pr: &serde_json::Value, is_new: bool) -> Result<()> {
     let number = pr["number"].as_i64().unwrap_or(0);
     let raw_json = serde_json::to_string(pr)?;
 
@@ -126,7 +159,7 @@ fn upsert_pr(conn: &Connection, repo_id: i64, repo_slug: &str, pr: &serde_json::
         _ => "open",
     };
 
-    conn.execute(
+    let pr_id: i64 = conn.query_row(
         "INSERT INTO pull_request
          (repo_id, number, gh_node_id, state, title, author, head_ref, head_sha,
           base_ref, mergeable, draft, additions, deletions, changed_files,
@@ -149,7 +182,8 @@ fn upsert_pr(conn: &Connection, repo_id: i64, repo_slug: &str, pr: &serde_json::
              merged_at     = excluded.merged_at,
              closed_at     = excluded.closed_at,
              body          = excluded.body,
-             raw_json      = excluded.raw_json",
+             raw_json      = excluded.raw_json
+         RETURNING id",
         params![
             repo_id,
             number,
@@ -172,20 +206,10 @@ fn upsert_pr(conn: &Connection, repo_id: i64, repo_slug: &str, pr: &serde_json::
             pr["body"].as_str(),
             raw_json,
         ],
-    )?;
-
-    let pr_id: i64 = conn.query_row(
-        "SELECT id FROM pull_request WHERE repo_id = ?1 AND number = ?2",
-        params![repo_id, number],
         |r| r.get(0),
     )?;
 
-    // Detect insert vs update: rowid changes on true insert, stays on conflict-update
-    let event = if conn.last_insert_rowid() == pr_id {
-        ChangeEvent::Inserted
-    } else {
-        ChangeEvent::Updated
-    };
+    let event = if is_new { ChangeEvent::Inserted } else { ChangeEvent::Updated };
     log_change(conn, "pull_request", pr_id, event, Some(repo_slug), None)?;
 
     // Reviews
@@ -309,7 +333,7 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let repo_id = db::upsert_repo(&conn, "o", "n", "main").unwrap();
 
-        upsert_pr(&conn, repo_id, "o/n", &make_pr(1, "OPEN", "First")).unwrap();
+        upsert_pr_for_test(&conn, repo_id, &make_pr(1, "OPEN", "First")).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pull_request", [], |r| r.get(0))
@@ -317,7 +341,7 @@ mod tests {
         assert_eq!(count, 1);
 
         // Update title via upsert
-        upsert_pr(&conn, repo_id, "o/n", &make_pr(1, "OPEN", "Updated")).unwrap();
+        upsert_pr_for_test(&conn, repo_id, &make_pr(1, "OPEN", "Updated")).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pull_request", [], |r| r.get(0))
             .unwrap();
@@ -334,7 +358,7 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let repo_id = db::upsert_repo(&conn, "o", "n", "main").unwrap();
 
-        upsert_pr(&conn, repo_id, "o/n", &make_pr(1, "MERGED", "x")).unwrap();
+        upsert_pr_for_test(&conn, repo_id, &make_pr(1, "MERGED", "x")).unwrap();
         let state: String = conn
             .query_row("SELECT state FROM pull_request WHERE number=1", [], |r| r.get(0))
             .unwrap();
@@ -350,7 +374,7 @@ mod tests {
         pr["reviews"]["nodes"] = serde_json::json!([
             { "databaseId": 101, "author": { "login": "bob" }, "state": "APPROVED", "body": "", "submittedAt": "2026-01-01T00:00:00Z" }
         ]);
-        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
+        upsert_pr_for_test(&conn, repo_id, &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_review", [], |r| r.get(0))
@@ -373,7 +397,7 @@ mod tests {
             { "name": "bug", "color": "red" },
             { "name": "urgent", "color": "orange" }
         ]);
-        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
+        upsert_pr_for_test(&conn, repo_id, &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_label", [], |r| r.get(0))
@@ -382,7 +406,7 @@ mod tests {
 
         // Re-sync with one label removed
         pr["labels"]["nodes"] = serde_json::json!([{ "name": "bug", "color": "red" }]);
-        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
+        upsert_pr_for_test(&conn, repo_id, &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_label", [], |r| r.get(0))
@@ -408,7 +432,7 @@ mod tests {
                 }
             }
         }]);
-        upsert_pr(&conn, repo_id, "o/n", &pr).unwrap();
+        upsert_pr_for_test(&conn, repo_id, &pr).unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM pr_status_check", [], |r| r.get(0))

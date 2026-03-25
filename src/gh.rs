@@ -13,6 +13,8 @@ pub trait GitHubClient {
 
 pub struct GhClient {
     pub binary: String,
+    pub rate_warn_threshold: i64,
+    pub rate_stop_threshold: i64,
 }
 
 pub struct GhRequest<'a> {
@@ -90,27 +92,20 @@ impl GhResponse {
     }
 }
 
-/// Thresholds for rate-limit back-off.
-/// Below WARN_THRESHOLD: sleep extra between calls.
-/// Below STOP_THRESHOLD: sleep until reset before proceeding.
-const REST_WARN_THRESHOLD: i64 = 500;
-const REST_STOP_THRESHOLD: i64 = 50;
-const GQL_WARN_THRESHOLD: i64 = 500;
-const GQL_STOP_THRESHOLD: i64 = 50;
-
 impl GhClient {
-    pub fn new(binary: impl Into<String>) -> Self {
-        GhClient { binary: binary.into() }
+    pub fn new(binary: impl Into<String>, warn_threshold: i64, stop_threshold: i64) -> Self {
+        GhClient {
+            binary: binary.into(),
+            rate_warn_threshold: warn_threshold,
+            rate_stop_threshold: stop_threshold,
+        }
     }
 }
 
 impl GitHubClient for GhClient {
     fn throttle_if_needed(&self, conn: &rusqlite::Connection, api_type: &str) -> Result<i64> {
-        let (warn, stop) = if api_type == "graphql" {
-            (GQL_WARN_THRESHOLD, GQL_STOP_THRESHOLD)
-        } else {
-            (REST_WARN_THRESHOLD, REST_STOP_THRESHOLD)
-        };
+        let warn = self.rate_warn_threshold;
+        let stop = self.rate_stop_threshold;
 
         let row: Option<(i64, i64)> = {
             let mut stmt = conn.prepare_cached(
@@ -510,7 +505,7 @@ mod tests {
     #[test]
     fn throttle_no_data_returns_max() {
         let conn = crate::db::open_in_memory().unwrap();
-        let client = GhClient::new("gh");
+        let client = GhClient::new("gh", 500, 50);
         let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
         assert_eq!(remaining, i64::MAX);
     }
@@ -532,7 +527,7 @@ mod tests {
             cache_hit: false,
             duration_ms: Some(50),
         }).unwrap();
-        let client = GhClient::new("gh");
+        let client = GhClient::new("gh", 500, 50);
         // Should return immediately (4800 > 500 warn threshold)
         let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
         assert_eq!(remaining, 4800);
@@ -555,7 +550,7 @@ mod tests {
             cache_hit: false,
             duration_ms: Some(50),
         }).unwrap();
-        let client = GhClient::new("gh");
+        let client = GhClient::new("gh", 500, 50);
         let remaining = client.throttle_if_needed(&conn, "graphql").unwrap();
         assert_eq!(remaining, i64::MAX); // no graphql calls yet
     }

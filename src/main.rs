@@ -5,6 +5,7 @@ mod gh;
 mod output;
 mod query;
 mod serve;
+mod setup;
 mod sync;
 
 use anyhow::Result;
@@ -22,7 +23,8 @@ use std::path::PathBuf;
           3. ./ghcache.toml\n  \
           4. ~/.config/ghcache/config.toml\n\n\
         Typical workflow:\n  \
-          ghcache init        # write config template\n  \
+          ghcache setup       # guided TUI setup (recommended)\n  \
+          ghcache init        # write a config template manually\n  \
           ghcache sync        # full initial sync\n  \
           ghcache watch       # continuous polling loop\n\n\
         Run `ghcache readme` for full documentation."
@@ -38,7 +40,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a config template and initialize the database
+    /// Interactive TUI setup -- guided config creation + initial sync
+    #[command(long_about = "Launches a terminal form (requires ghcache-init on PATH or next to \
+        the ghcache binary) to collect your GitHub account details, writes ghcache.toml, \
+        and runs the initial sync automatically.\n\n\
+        Build the form: cd init-form && go build -o ghcache-init .")]
+    Setup,
+    /// Write a config template to ghcache.toml (non-interactive)
     Init,
     /// Print the resolved config (for debugging)
     Config,
@@ -118,6 +126,9 @@ fn main() -> Result<()> {
         Cmd::Init => {
             return cmd_init();
         }
+        Cmd::Setup => {
+            return setup::run(cli.config.as_deref());
+        }
         Cmd::Readme => {
             print!("{}", include_str!("../README.md"));
             return Ok(());
@@ -132,7 +143,7 @@ fn main() -> Result<()> {
         .init();
 
     match cli.cmd {
-        Cmd::Init | Cmd::Readme => unreachable!(),
+        Cmd::Init | Cmd::Setup | Cmd::Readme => unreachable!(),
         Cmd::Config => cmd_config(&cfg),
         Cmd::DbPath => {
             println!("{}", cfg.db_path.display());
@@ -144,7 +155,7 @@ fn main() -> Result<()> {
         }
         Cmd::Sync { repo, prs, notifications, events } => {
             let conn = db::open(&cfg.db_path)?;
-            let gh = gh::GhClient::new(&cfg.gh_binary);
+            let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
             sync::run(&conn, &gh, &cfg, filter, true)
         }
@@ -153,7 +164,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("--daemon not yet implemented");
             }
             let conn = db::open(&cfg.db_path)?;
-            let gh = gh::GhClient::new(&cfg.gh_binary);
+            let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
             sync::watch(&conn, &gh, &cfg)
         }
         Cmd::Query { sub } => {
@@ -177,20 +188,28 @@ fn main() -> Result<()> {
 
 fn cmd_init() -> Result<()> {
     let template = r#"[global]
-db_path = "~/.local/share/ghcache/gh.db"
-staging_folder = "~/src/staging"
+db_path               = "~/.local/share/ghcache/gh.db"
+staging_folder        = "~/.local/share/ghcache/repos"
 poll_interval_seconds = 60
-log_level = "info"
-gh_binary = "gh"
+log_level             = "info"
+gh_binary             = "gh"
 
-[[repo]]
-owner = "myorg"
-name = "backend"
-default_branch = "main"
-sync_prs = true
-sync_notifications = true
-sync_events = true
-sync_branches = ["main", "staging"]
+# Sync all repos under a GitHub user or org:
+[[org]]
+owner         = "myorg"
+sync_prs      = true
+sync_events   = true
+sync_branches = ["main"]
+exclude       = []
+
+# Or target specific repos:
+# [[repo]]
+# owner          = "myorg"
+# name           = "backend"
+# default_branch = "main"
+# sync_prs       = true
+# sync_events    = true
+# sync_branches  = ["main", "staging"]
 "#;
     let path = PathBuf::from("ghcache.toml");
     if path.exists() {

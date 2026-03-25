@@ -50,16 +50,13 @@ pub fn upsert_repo(
     name: &str,
     default_branch: &str,
 ) -> Result<i64> {
-    conn.execute(
+    let id = conn.query_row(
         "INSERT INTO repo (owner, name, default_branch)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(owner, name) DO UPDATE SET
-             default_branch = excluded.default_branch",
+             default_branch = excluded.default_branch
+         RETURNING id",
         params![owner, name, default_branch],
-    )?;
-    let id = conn.query_row(
-        "SELECT id FROM repo WHERE owner = ?1 AND name = ?2",
-        params![owner, name],
         |row| row.get(0),
     )?;
     Ok(id)

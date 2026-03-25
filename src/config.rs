@@ -8,6 +8,8 @@ pub struct Config {
     pub global: Global,
     #[serde(rename = "repo", default)]
     pub repos: Vec<RepoConfig>,
+    #[serde(rename = "org", default)]
+    pub orgs: Vec<OrgConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -17,6 +19,10 @@ pub struct Global {
     pub poll_interval_seconds: Option<u64>,
     pub log_level: Option<String>,
     pub gh_binary: Option<String>,
+    /// REST + GraphQL remaining-calls count below which polling slows down (default 500).
+    pub rate_warn_threshold: Option<i64>,
+    /// REST + GraphQL remaining-calls count below which polling stops until reset (default 50).
+    pub rate_stop_threshold: Option<i64>,
 }
 
 impl Default for Global {
@@ -27,6 +33,8 @@ impl Default for Global {
             poll_interval_seconds: Some(60),
             log_level: Some("info".into()),
             gh_binary: Some("gh".into()),
+            rate_warn_threshold: Some(500),
+            rate_stop_threshold: Some(50),
         }
     }
 }
@@ -40,9 +48,24 @@ pub struct RepoConfig {
     pub sync_notifications: Option<bool>,
     pub sync_events: Option<bool>,
     pub sync_branches: Option<Vec<String>>,
-    #[allow(dead_code)]
     pub checkout_on_sync: Option<bool>,
     pub poll_interval_seconds: Option<u64>,
+}
+
+/// Sync all repos under a GitHub user or org account.
+/// Discovered repos are treated as if they were [[repo]] entries with these defaults.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OrgConfig {
+    pub owner: String,
+    pub sync_prs: Option<bool>,
+    pub sync_notifications: Option<bool>,
+    pub sync_events: Option<bool>,
+    pub sync_branches: Option<Vec<String>>,
+    pub checkout_on_sync: Option<bool>,
+    pub poll_interval_seconds: Option<u64>,
+    /// Repo names to skip (exact match)
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 impl RepoConfig {
@@ -65,7 +88,10 @@ pub struct ResolvedConfig {
     pub poll_interval_seconds: u64,
     pub log_level: String,
     pub gh_binary: String,
+    pub rate_warn_threshold: i64,
+    pub rate_stop_threshold: i64,
     pub repos: Vec<RepoConfig>,
+    pub orgs: Vec<OrgConfig>,
 }
 
 pub fn load(explicit_path: Option<&Path>) -> Result<ResolvedConfig> {
@@ -98,8 +124,8 @@ fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn validate(config: Config) -> Result<ResolvedConfig> {
-    if config.repos.is_empty() {
-        bail!("config must have at least one [[repo]] entry");
+    if config.repos.is_empty() && config.orgs.is_empty() {
+        bail!("config must have at least one [[repo]] or [[org]] entry");
     }
 
     let db_path = config
@@ -111,10 +137,8 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
 
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            bail!(
-                "db_path parent directory does not exist: {}",
-                parent.display()
-            );
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating db_path directory {}", parent.display()))?;
         }
     }
 
@@ -135,7 +159,10 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         poll_interval_seconds: config.global.poll_interval_seconds.unwrap_or(60),
         log_level: config.global.log_level.unwrap_or_else(|| "info".into()),
         gh_binary: config.global.gh_binary.unwrap_or_else(|| "gh".into()),
+        rate_warn_threshold: config.global.rate_warn_threshold.unwrap_or(500),
+        rate_stop_threshold: config.global.rate_stop_threshold.unwrap_or(50),
         repos: config.repos,
+        orgs: config.orgs,
     })
 }
 
@@ -204,7 +231,7 @@ name = "backend"
 "#,
         );
         let err = load(Some(f.path())).unwrap_err();
-        assert!(err.to_string().contains("does not exist"));
+        assert!(err.to_string().contains("creating db_path directory"));
     }
 
     #[test]

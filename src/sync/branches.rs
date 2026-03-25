@@ -32,6 +32,21 @@ pub fn sync(
         None => return Ok(()),
     };
 
+    let slug = format!("{owner}/{name}");
+
+    // Preload existing branch names for this repo so insert vs update detection
+    // requires no per-row SELECT.
+    let existing: std::collections::HashSet<String> = {
+        use std::collections::HashSet;
+        let mut stmt = conn.prepare("SELECT name FROM branch WHERE repo_id=?1")?;
+        let mut set = HashSet::new();
+        let mut rows = stmt.query(params![repo_id])?;
+        while let Some(row) = rows.next()? {
+            set.insert(row.get::<_, String>(0)?);
+        }
+        set
+    };
+
     let mut synced = 0usize;
     for branch in branches {
         let branch_name = match branch["name"].as_str() {
@@ -45,27 +60,20 @@ pub fn sync(
 
         let sha = branch["commit"]["sha"].as_str();
         let now = chrono::Utc::now().to_rfc3339();
+        let is_new = !existing.contains(branch_name);
 
-        conn.execute(
+        let branch_id: i64 = conn.query_row(
             "INSERT INTO branch (repo_id, name, sha, updated_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(repo_id, name) DO UPDATE SET
                  sha        = excluded.sha,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at
+             RETURNING id",
             params![repo_id, branch_name, sha, now],
-        )?;
-
-        let branch_id: i64 = conn.query_row(
-            "SELECT id FROM branch WHERE repo_id=?1 AND name=?2",
-            params![repo_id, branch_name],
             |r| r.get(0),
         )?;
-        let event = if conn.last_insert_rowid() == branch_id {
-            ChangeEvent::Inserted
-        } else {
-            ChangeEvent::Updated
-        };
-        let slug = format!("{owner}/{name}");
+
+        let event = if is_new { ChangeEvent::Inserted } else { ChangeEvent::Updated };
         db::log_change(conn, "branch", branch_id, event, Some(&slug), None)?;
         synced += 1;
     }

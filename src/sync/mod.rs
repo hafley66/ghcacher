@@ -8,9 +8,9 @@ use rusqlite::Connection;
 use std::time::Duration;
 
 use crate::checkout;
-use crate::config::ResolvedConfig;
+use crate::config::{OrgConfig, RepoConfig, ResolvedConfig};
 use crate::db;
-use crate::gh::GitHubClient;
+use crate::gh::{GhRequest, GitHubClient};
 
 pub struct SyncFilter {
     pub repo: Option<String>,
@@ -37,11 +37,86 @@ impl SyncFilter {
     }
 }
 
+/// Discover all repo names under a GitHub org or user account.
+/// Tries /orgs/{owner}/repos first; falls back to /users/{owner}/repos on 404.
+/// ETag-gated and paginated -- typically a free 304 after the first call.
+fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> Result<Vec<String>> {
+    let org_endpoint = format!("/orgs/{owner}/repos");
+    let user_endpoint = format!("/users/{owner}/repos");
+
+    let poll = db::get_poll_state(conn, &org_endpoint)?;
+    let mut req = GhRequest::get(&org_endpoint).paginated();
+    if let Some(ref etag) = poll.etag {
+        req = req.with_etag(etag);
+    }
+
+    let resp = gh.call(conn, &req)?;
+
+    let body = if resp.status == 404 {
+        // Not an org account; try the user endpoint.
+        let poll2 = db::get_poll_state(conn, &user_endpoint)?;
+        let mut req2 = GhRequest::get(&user_endpoint).paginated();
+        if let Some(ref etag) = poll2.etag {
+            req2 = req2.with_etag(etag);
+        }
+        let resp2 = gh.call(conn, &req2)?;
+        if resp2.is_not_modified() {
+            return Ok(vec![]);
+        }
+        resp2.body
+    } else if resp.is_not_modified() {
+        return Ok(vec![]);
+    } else {
+        resp.body
+    };
+
+    let names: Vec<String> = body
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    tracing::info!(owner, count = names.len() as u64, "discovered org repos");
+    Ok(names)
+}
+
+fn org_to_repos(org: &OrgConfig, names: Vec<String>) -> Vec<RepoConfig> {
+    names
+        .into_iter()
+        .filter(|n| !org.exclude.contains(n))
+        .map(|name| RepoConfig {
+            owner: org.owner.clone(),
+            name,
+            default_branch: None,
+            sync_prs: org.sync_prs,
+            sync_notifications: org.sync_notifications,
+            sync_events: org.sync_events,
+            sync_branches: org.sync_branches.clone(),
+            checkout_on_sync: org.checkout_on_sync,
+            poll_interval_seconds: org.poll_interval_seconds,
+        })
+        .collect()
+}
+
 /// `full_sweep` forces a full GraphQL fetch of all open PRs instead of
 /// using event hints to target only changed PRs. Always true for one-shot
 /// `ghcache sync`; true only on the first iteration of `ghcache watch`.
 pub fn run(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig, filter: SyncFilter, full_sweep: bool) -> Result<()> {
-    for repo in &cfg.repos {
+    // Expand [[org]] entries into synthetic RepoConfigs.
+    let mut org_repos: Vec<RepoConfig> = vec![];
+    for org in &cfg.orgs {
+        match discover_org_repos(conn, gh, &org.owner) {
+            Ok(names) => org_repos.extend(org_to_repos(org, names)),
+            Err(e) => tracing::error!(owner = %org.owner, error = %e, "org repo discovery failed"),
+        }
+    }
+
+    let all_repos: Vec<&RepoConfig> = cfg.repos.iter().chain(org_repos.iter()).collect();
+
+    for repo in all_repos {
         if let Some(ref slug) = filter.repo {
             if &repo.slug() != slug {
                 continue;
@@ -114,7 +189,7 @@ pub fn watch(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> 
         first_run = false;
 
         if let Some(ref staging) = cfg.staging_folder {
-            let tasks: Vec<checkout::CheckoutTask> = cfg.repos.iter()
+            let mut tasks: Vec<checkout::CheckoutTask> = cfg.repos.iter()
                 .filter(|r| r.checkout_on_sync.unwrap_or(false))
                 .flat_map(|r| {
                     let repo_id = match db::get_repo_id(conn, &r.owner, &r.name) {
@@ -129,6 +204,29 @@ pub fn watch(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> 
                     }).collect()
                 })
                 .collect();
+
+            // Org repos were upserted into the DB during sync; query by owner.
+            for org in cfg.orgs.iter().filter(|o| o.checkout_on_sync.unwrap_or(false)) {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT id, name FROM repo WHERE owner = ?1"
+                ).unwrap();
+                let rows: Vec<(i64, String)> = stmt
+                    .query_map(rusqlite::params![org.owner], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                for (repo_id, name) in rows {
+                    for branch in org.sync_branches.as_deref().unwrap_or(&[]) {
+                        tasks.push(checkout::CheckoutTask {
+                            repo_id,
+                            owner: org.owner.clone(),
+                            name: name.clone(),
+                            branch: branch.clone(),
+                        });
+                    }
+                }
+            }
+
             if !tasks.is_empty() {
                 if let Err(e) = checkout::checkout_all(conn, staging, &tasks) {
                     tracing::error!(error = %e, "checkout_all failed");
@@ -156,6 +254,8 @@ mod tests {
             poll_interval_seconds: 60,
             log_level: "info".into(),
             gh_binary: "gh".into(),
+            rate_warn_threshold: 500,
+            rate_stop_threshold: 50,
             repos: vec![RepoConfig {
                 owner: owner.into(),
                 name: name.into(),
@@ -167,6 +267,7 @@ mod tests {
                 checkout_on_sync: None,
                 poll_interval_seconds: None,
             }],
+            orgs: vec![],
         }
     }
 

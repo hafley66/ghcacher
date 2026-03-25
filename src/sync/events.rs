@@ -54,11 +54,7 @@ pub fn sync(conn: &Connection, gh: &dyn GitHubClient, repo_id: i64, owner: &str,
             ],
         )?;
         if n > 0 {
-            let row_id: i64 = conn.query_row(
-                "SELECT id FROM repo_event WHERE repo_id=?1 AND gh_id=?2",
-                params![repo_id, gh_id],
-                |r| r.get(0),
-            )?;
+            let row_id = conn.last_insert_rowid();
             db::log_change(conn, "repo_event", row_id, ChangeEvent::Inserted, Some(&slug), None)?;
 
             if let Some(pr_num) = pr_number_from_event(ev_type, payload) {

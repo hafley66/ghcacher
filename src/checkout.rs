@@ -49,20 +49,48 @@ pub fn checkout_all(
     staging: &Path,
     tasks: &[CheckoutTask],
 ) -> Result<()> {
+    // Batch-load branch SHAs and stored checkout SHAs for all tasks in one query.
+    // Build IN clause from unique repo_ids; all branches for those repos are loaded
+    // and matched in Rust, which is cheaper than 2*N individual queries.
+    let unique_repo_ids: Vec<i64> = {
+        use std::collections::HashSet;
+        tasks.iter().map(|t| t.repo_id).collect::<HashSet<_>>().into_iter().collect()
+    };
+    let placeholders = (1..=unique_repo_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT b.repo_id, b.name, b.sha, c.sha
+         FROM branch b
+         LEFT JOIN checkout c ON c.repo_id = b.repo_id AND c.branch = b.name
+         WHERE b.repo_id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    for (i, id) in unique_repo_ids.iter().enumerate() {
+        stmt.raw_bind_parameter(i + 1, *id)?;
+    }
+    let sha_map: std::collections::HashMap<(i64, String), (Option<String>, Option<String>)> = {
+        use std::collections::HashMap;
+        let mut map: HashMap<(i64, String), (Option<String>, Option<String>)> = HashMap::new();
+        let mut rows = stmt.raw_query();
+        while let Some(row) = rows.next()? {
+            let repo_id: i64 = row.get(0)?;
+            let branch: String = row.get(1)?;
+            let branch_sha: Option<String> = row.get(2)?;
+            let checkout_sha: Option<String> = row.get(3)?;
+            map.insert((repo_id, branch), (branch_sha, checkout_sha));
+        }
+        map
+    };
+
     let items: Vec<WorkItem> = tasks.iter().map(|t| {
         let local_path = staging.join(&t.owner).join(&t.branch).join(&t.name);
 
-        let new_sha: Option<String> = conn.query_row(
-            "SELECT sha FROM branch WHERE repo_id=?1 AND name=?2",
-            params![t.repo_id, t.branch],
-            |r| r.get(0),
-        ).ok().flatten();
-
-        let stored_sha: Option<String> = conn.query_row(
-            "SELECT sha FROM checkout WHERE repo_id=?1 AND branch=?2",
-            params![t.repo_id, t.branch],
-            |r| r.get(0),
-        ).ok().flatten();
+        let (new_sha, stored_sha) = sha_map
+            .get(&(t.repo_id, t.branch.clone()))
+            .cloned()
+            .unwrap_or((None, None));
 
         let op = if new_sha.is_some() && new_sha == stored_sha {
             Op::Skip
