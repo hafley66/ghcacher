@@ -5,6 +5,7 @@ pub mod prs;
 
 use anyhow::Result;
 use rusqlite::Connection;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::checkout;
@@ -144,10 +145,32 @@ pub fn run(
 ) -> Result<()> {
     // Expand [[org]] entries into synthetic RepoConfigs.
     let mut org_repos: Vec<RepoConfig> = vec![];
+    let mut org_owners: HashSet<String> = HashSet::new();
     for org in &cfg.orgs {
         match discover_org_repos(conn, gh, &org.owner) {
-            Ok(names) => org_repos.extend(org_to_repos(org, names)),
+            Ok(names) => {
+                org_owners.insert(org.owner.clone());
+                org_repos.extend(org_to_repos(org, names));
+            }
             Err(e) => tracing::error!(owner = %org.owner, error = %e, "org repo discovery failed"),
+        }
+    }
+
+    // Sync events once per org (one API call instead of one per repo).
+    // Returns repo_name -> dirty PR numbers; used below to drive targeted syncs.
+    let mut org_dirty: HashMap<(String, String), Vec<i64>> = HashMap::new();
+    if filter.do_events() {
+        for org in &cfg.orgs {
+            if org.sync_events.unwrap_or(false) {
+                match events::sync_org(conn, gh, &org.owner) {
+                    Ok(dirty) => {
+                        for (name, prs) in dirty {
+                            org_dirty.insert((org.owner.clone(), name), prs);
+                        }
+                    }
+                    Err(e) => tracing::error!(owner = %org.owner, error = %e, "org events sync failed"),
+                }
+            }
         }
     }
 
@@ -172,9 +195,17 @@ pub fn run(
             let default_branch = repo.default_branch.as_deref().unwrap_or("main");
             let repo_id = db::upsert_repo(conn, &repo.owner, &repo.name, default_branch)?;
 
-            // Events first so their PR-number hints are available before PR sync.
+            // Events: use the pre-fetched org batch for org repos; fall back to
+            // per-repo call for [[repo]] entries and subscription extras.
             if filter.do_events() && repo.sync_events.unwrap_or(false) {
-                dirty_prs = events::sync(conn, gh, repo_id, &repo.owner, &repo.name)?;
+                if org_owners.contains(&repo.owner) {
+                    dirty_prs = org_dirty
+                        .get(&(repo.owner.clone(), repo.name.clone()))
+                        .cloned()
+                        .unwrap_or_default();
+                } else {
+                    dirty_prs = events::sync(conn, gh, repo_id, &repo.owner, &repo.name)?;
+                }
             }
 
             if filter.do_prs() && repo.sync_prs.unwrap_or(false) {
