@@ -1,3 +1,4 @@
+mod checkout;
 mod config;
 mod db;
 mod gh;
@@ -11,7 +12,21 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "ghcache", about = "GitHub CLI cache layer backed by SQLite")]
+#[command(
+    name = "ghcache",
+    about = "GitHub CLI cache layer backed by SQLite",
+    long_about = "GitHub CLI cache layer backed by SQLite.\n\n\
+        Config file search order:\n  \
+          1. --config <path>\n  \
+          2. $GHCACHE_CONFIG\n  \
+          3. ./ghcache.toml\n  \
+          4. ~/.config/ghcache/config.toml\n\n\
+        Typical workflow:\n  \
+          ghcache init        # write config template\n  \
+          ghcache sync        # full initial sync\n  \
+          ghcache watch       # continuous polling loop\n\n\
+        Run `ghcache readme` for full documentation."
+)]
 struct Cli {
     /// Path to config file (overrides $GHCACHE_CONFIG and default locations)
     #[arg(long, global = true)]
@@ -27,13 +42,17 @@ enum Cmd {
     Init,
     /// Print the resolved config (for debugging)
     Config,
-    /// Print the resolved database path
+    /// Print the resolved database path -- useful for: sqlite3 $(ghcache db-path)
     DbPath,
     /// Show sync state: last poll times, rate limit, DB size
     Status,
-    /// Sync repos per config
+    /// Sync repos per config (full sweep)
+    #[command(long_about = "Full sweep sync: fetches all open PRs, events, notifications, and \
+        branches for every configured repo.\n\n\
+        --repo restricts to one repo; --prs/--notifications/--events restrict to one data type.\n\
+        Always performs a full GraphQL PR fetch regardless of event hints.")]
     Sync {
-        /// Sync a single repo (owner/name)
+        /// Restrict to one repo (owner/name)
         #[arg(long)]
         repo: Option<String>,
         /// Sync only PRs
@@ -46,9 +65,16 @@ enum Cmd {
         #[arg(long)]
         events: bool,
     },
-    /// Continuous sync loop
+    /// Continuous polling loop (event-targeted after first pass)
+    #[command(long_about = "Continuous polling loop.\n\n\
+        First iteration: full sweep (same as `ghcache sync`).\n\
+        Subsequent iterations: event-targeted -- only PRs mentioned in GitHub event payloads \
+        are re-fetched via GraphQL. Most polls are free 304 Not Modified responses.\n\n\
+        Repos with checkout_on_sync = true in config have their sync_branches checked out \
+        into staging_folder after each pass.\n\n\
+        --daemon is not yet implemented.")]
     Watch {
-        /// Fork to background
+        /// Fork to background (not yet implemented)
         #[arg(long)]
         daemon: bool,
     },
@@ -57,18 +83,32 @@ enum Cmd {
         #[command(subcommand)]
         sub: query::QueryCmd,
     },
-    /// Broadcast change_log events to Unix socket subscribers
+    /// Broadcast change_log rows as NDJSON over a Unix socket
+    #[command(long_about = "Tails change_log and broadcasts new rows as NDJSON to all connected \
+        Unix socket subscribers.\n\n\
+        Default socket: $XDG_RUNTIME_DIR/ghcache.sock or /tmp/ghcache.sock.\n\
+        Use ghcache-client for a typed Rust subscriber.")]
     Serve {
         /// Unix socket path (default: $XDG_RUNTIME_DIR/ghcache.sock or /tmp/ghcache.sock)
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
     },
-    /// Checkout a branch into staging_folder
+    /// Clone or update a branch into staging_folder
+    #[command(long_about = "Clone or update a branch into staging_folder.\n\n\
+        Path convention: {staging_folder}/{owner}/{branch}/{name}\n\
+        Example: myorg/backend branch main  ->  ~/src/staging/myorg/main/backend\n\n\
+        First checkout: gh repo clone owner/name dest -- --branch branch\n\
+        Subsequent:     git fetch origin branch && git reset --hard FETCH_HEAD\n\
+        (skipped if branch.sha in DB matches last recorded checkout sha)\n\n\
+        Requires staging_folder in config and the repo to exist in the DB (run sync first).\n\
+        watch runs this automatically for repos with checkout_on_sync = true.")]
     Checkout {
-        /// owner/name format
+        /// owner/name
         repo: String,
         branch: String,
     },
+    /// Print full documentation (README)
+    Readme,
 }
 
 fn main() -> Result<()> {
@@ -77,6 +117,10 @@ fn main() -> Result<()> {
     let cfg = match &cli.cmd {
         Cmd::Init => {
             return cmd_init();
+        }
+        Cmd::Readme => {
+            print!("{}", include_str!("../README.md"));
+            return Ok(());
         }
         _ => config::load(cli.config.as_deref())?,
     };
@@ -88,7 +132,7 @@ fn main() -> Result<()> {
         .init();
 
     match cli.cmd {
-        Cmd::Init => unreachable!(),
+        Cmd::Init | Cmd::Readme => unreachable!(),
         Cmd::Config => cmd_config(&cfg),
         Cmd::DbPath => {
             println!("{}", cfg.db_path.display());
@@ -122,7 +166,11 @@ fn main() -> Result<()> {
             serve::run(&conn, &path)
         }
         Cmd::Checkout { repo, branch } => {
-            anyhow::bail!("checkout not yet implemented: {repo}/{branch}");
+            let staging = cfg.staging_folder.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("staging_folder not set in config"))?;
+            let conn = db::open(&cfg.db_path)?;
+            let (owner, name) = checkout::parse_slug(&repo)?;
+            checkout::checkout_one(&conn, staging, &owner, &name, &branch)
         }
     }
 }

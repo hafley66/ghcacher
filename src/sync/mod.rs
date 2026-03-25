@@ -7,6 +7,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::time::Duration;
 
+use crate::checkout;
 use crate::config::ResolvedConfig;
 use crate::db;
 use crate::gh::GitHubClient;
@@ -111,6 +112,29 @@ pub fn watch(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> 
             tracing::error!(error = %e, "watch sync error");
         }
         first_run = false;
+
+        if let Some(ref staging) = cfg.staging_folder {
+            let tasks: Vec<checkout::CheckoutTask> = cfg.repos.iter()
+                .filter(|r| r.checkout_on_sync.unwrap_or(false))
+                .flat_map(|r| {
+                    let repo_id = match db::get_repo_id(conn, &r.owner, &r.name) {
+                        Ok(Some(id)) => id,
+                        _ => return vec![],
+                    };
+                    r.sync_branches.as_deref().unwrap_or(&[]).iter().map(|b| checkout::CheckoutTask {
+                        repo_id,
+                        owner: r.owner.clone(),
+                        name: r.name.clone(),
+                        branch: b.clone(),
+                    }).collect()
+                })
+                .collect();
+            if !tasks.is_empty() {
+                if let Err(e) = checkout::checkout_all(conn, staging, &tasks) {
+                    tracing::error!(error = %e, "checkout_all failed");
+                }
+            }
+        }
 
         let interval = cfg.poll_interval_seconds;
         tracing::debug!(sleep_seconds = interval, "watch sleeping");
