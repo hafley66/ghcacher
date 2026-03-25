@@ -52,12 +52,13 @@ fn post_json(port: u16, path: &str, body: &str) -> Result<serde_json::Value> {
 /// subscription is alive.
 ///
 /// Call [`heartbeat`] periodically to keep the subscription alive.
-pub fn ensure_repo(port: u16, uuid: &str, owner: &str, repo: &str, pr_sync: bool) -> Result<PathBuf> {
+pub fn ensure_repo(port: u16, uuid: &str, owner: &str, repo: &str, pr_sync: bool, notifications: bool) -> Result<PathBuf> {
     let body = serde_json::json!({
         "uuid": uuid,
         "owner": owner,
         "repo": repo,
         "pr_sync": pr_sync,
+        "notifications": notifications,
     })
     .to_string();
 
@@ -73,4 +74,16 @@ pub fn heartbeat(port: u16, uuid: &str) -> Result<bool> {
     let body = serde_json::json!({"uuid": uuid}).to_string();
     let resp = post_json(port, "/heartbeat", &body)?;
     Ok(resp["ok"].as_bool().unwrap_or(false))
+}
+
+/// Pause the ghcache sync loop.
+pub fn pause(port: u16) -> Result<()> {
+    post_json(port, "/pause", "{}")?;
+    Ok(())
+}
+
+/// Resume the ghcache sync loop after a pause.
+pub fn resume(port: u16) -> Result<()> {
+    post_json(port, "/resume", "{}")?;
+    Ok(())
 }

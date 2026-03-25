@@ -405,3 +405,107 @@ mod tests {
         assert_eq!(mock.graphql_call_count(), 0);
     }
 }
+
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use crate::config::{RepoConfig, ResolvedConfig};
+    use crate::db;
+    use crate::gh::GhClient;
+
+    fn live_cfg(tmp: &std::path::Path) -> ResolvedConfig {
+        ResolvedConfig {
+            db_path: tmp.join("test.db"),
+            staging_folder: tmp.to_path_buf(),
+            poll_interval_seconds: 60,
+            log_level: "warn".into(),
+            gh_binary: "gh".into(),
+            rate_warn_threshold: 500,
+            rate_stop_threshold: 50,
+            cmd_port: 7748,
+            heartbeat_ttl_seconds: 30,
+            repos: vec![RepoConfig {
+                owner: "hafley66".into(),
+                name: "cc-hud".into(),
+                default_branch: Some("main".into()),
+                sync_prs: Some(true),
+                sync_events: Some(true),
+                sync_notifications: Some(false),
+                sync_branches: Some(vec!["main".into()]),
+                checkout_on_sync: None,
+                poll_interval_seconds: None,
+            }],
+            orgs: vec![],
+        }
+    }
+
+    fn all_filter() -> SyncFilter {
+        SyncFilter { repo: None, prs_only: false, notifs_only: false, events_only: false }
+    }
+
+    /// Full sync against real hafley66/cc-hud, then a second pass to confirm 304 cache hits.
+    /// Run with: cargo test integration -- --include-ignored
+    #[test]
+    #[ignore = "requires gh CLI authenticated"]
+    fn live_sync_and_cache_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = live_cfg(tmp.path());
+        let conn = db::open(&cfg.db_path).unwrap();
+        let gh = GhClient::new("gh", 500, 50, true, false); // silent=true: no stdout noise in test
+
+        // --- first pass: full sweep ---
+        run(&conn, &gh, &cfg, all_filter(), true, &[], &[]).unwrap();
+
+        let repo_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM repo WHERE owner='hafley66' AND name='cc-hud'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(repo_count, 1, "repo not inserted");
+
+        let branch_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM branch b
+             JOIN repo r ON r.id = b.repo_id
+             WHERE r.owner='hafley66' AND r.name='cc-hud'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(branch_count >= 1, "no branches synced; got {branch_count}");
+
+        let main_sha: String = conn.query_row(
+            "SELECT b.sha FROM branch b
+             JOIN repo r ON r.id = b.repo_id
+             WHERE r.owner='hafley66' AND r.name='cc-hud' AND b.name='main'",
+            [], |r| r.get(0),
+        ).expect("main branch not in DB");
+        assert!(!main_sha.is_empty(), "main branch sha is empty");
+
+        let rest_calls: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM call_log WHERE api_type='rest'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(rest_calls > 0, "no REST calls logged");
+
+        let change_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM change_log",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(change_rows > 0, "change_log empty after first sync");
+
+        // --- second pass: should be all 304s ---
+        run(&conn, &gh, &cfg, all_filter(), false, &[], &[]).unwrap();
+
+        let cache_hits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM call_log WHERE cache_hit=1",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert!(cache_hits > 0, "second sync had no cache hits (expected 304s)");
+
+        // sha is stable across passes
+        let main_sha2: String = conn.query_row(
+            "SELECT b.sha FROM branch b
+             JOIN repo r ON r.id = b.repo_id
+             WHERE r.owner='hafley66' AND r.name='cc-hud' AND b.name='main'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(main_sha, main_sha2, "main branch sha changed between syncs unexpectedly");
+    }
+}

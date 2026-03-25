@@ -22,17 +22,32 @@ use std::path::PathBuf;
           2. $GHCACHE_CONFIG\n  \
           3. ./ghcache.toml\n  \
           4. ~/.config/ghcache/config.toml\n\n\
+        Global flags:\n  \
+          --silent / -s      suppress JSON rate-limit summary lines on stdout\n  \
+          --calls-to-stdout  print each API call as a JSON line (endpoint, cost, duration)\n\n\
+        Rate-limit summary (emitted after every call, suppressed by --silent):\n  \
+          {\"ts\":\"...\",\"gh_points_rest_remaining\":4800,\"gh_points_graphql_remaining\":4950}\n\
+        Per-call detail (emitted when --calls-to-stdout is set):\n  \
+          {\"ts\":\"...\",\"api_type\":\"graphql\",\"endpoint\":\"...\",\"gql_cost\":1,\"rate_remaining\":4950,\"duration_ms\":150}\n\n\
         Typical workflow:\n  \
           ghcache setup       # guided TUI setup (recommended)\n  \
           ghcache init        # write a config template manually\n  \
           ghcache sync        # full initial sync\n  \
-          ghcache watch       # continuous polling loop\n\n\
+          ghcache watch       # continuous polling loop + HTTP server on 127.0.0.1:7748\n\n\
         Run `ghcache readme` for full documentation."
 )]
 struct Cli {
     /// Path to config file (overrides $GHCACHE_CONFIG and default locations)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Suppress JSON rate-limit log lines on stdout
+    #[arg(short = 's', long, global = true)]
+    silent: bool,
+
+    /// Print each API call as a JSON line on stdout (endpoint, status, rate_remaining, gql_cost, duration_ms)
+    #[arg(long, global = true)]
+    calls_to_stdout: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -80,6 +95,9 @@ enum Cmd {
         are re-fetched via GraphQL. Most polls are free 304 Not Modified responses.\n\n\
         Repos with checkout_on_sync = true in config have their sync_branches checked out \
         into staging_folder after each pass.\n\n\
+        Also starts the HTTP command server on 127.0.0.1:{cmd_port} (default 7748).\n\
+        Endpoints: GET /events (SSE), POST /subscribe, POST /heartbeat, POST /pause, POST /resume.\n\n\
+        --no-sync: start the HTTP server only; skip the sync loop entirely.\n\
         --daemon is not yet implemented.")]
     Watch {
         /// Fork to background (not yet implemented)
@@ -96,8 +114,8 @@ enum Cmd {
     },
     /// Clone or update a branch into staging_folder
     #[command(long_about = "Clone or update a branch into staging_folder.\n\n\
-        Path convention: {staging_folder}/{owner}/{branch}/{name}\n\
-        Example: myorg/backend branch main  ->  ~/src/staging/myorg/main/backend\n\n\
+        Path convention: {staging_folder}/{owner}/{name}\n\
+        Example: myorg/backend branch main  ->  ~/src/staging/myorg/backend\n\n\
         First checkout: gh repo clone owner/name dest -- --branch branch\n\
         Subsequent:     git fetch origin branch && git reset --hard FETCH_HEAD\n\
         (skipped if branch.sha in DB matches last recorded checkout sha)\n\n\
@@ -148,7 +166,7 @@ fn main() -> Result<()> {
         }
         Cmd::Sync { repo, prs, notifications, events } => {
             let conn = db::open(&cfg.db_path)?;
-            let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
+            let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold, cli.silent, cli.calls_to_stdout);
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
             sync::run(&conn, &gh, &cfg, filter, true, &[], &[])
         }
@@ -157,7 +175,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("--daemon not yet implemented");
             }
             let conn = db::open(&cfg.db_path)?;
-            let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
+            let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold, cli.silent, cli.calls_to_stdout);
             let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let subs = {
                 let subs = cmd::Subscriptions::new(std::time::Duration::from_secs(cfg.heartbeat_ttl_seconds));

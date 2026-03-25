@@ -85,7 +85,7 @@ pub fn checkout_all(
     };
 
     let items: Vec<WorkItem> = tasks.iter().map(|t| {
-        let local_path = staging.join(&t.owner).join(&t.branch).join(&t.name);
+        let local_path = staging.join(&t.owner).join(&t.name);
 
         let (new_sha, stored_sha) = sha_map
             .get(&(t.repo_id, t.branch.clone()))

@@ -15,6 +15,8 @@ pub struct GhClient {
     pub binary: String,
     pub rate_warn_threshold: i64,
     pub rate_stop_threshold: i64,
+    pub silent: bool,
+    pub calls_to_stdout: bool,
 }
 
 pub struct GhRequest<'a> {
@@ -93,12 +95,26 @@ impl GhResponse {
 }
 
 impl GhClient {
-    pub fn new(binary: impl Into<String>, warn_threshold: i64, stop_threshold: i64) -> Self {
+    pub fn new(binary: impl Into<String>, warn_threshold: i64, stop_threshold: i64, silent: bool, calls_to_stdout: bool) -> Self {
         GhClient {
             binary: binary.into(),
             rate_warn_threshold: warn_threshold,
             rate_stop_threshold: stop_threshold,
+            silent,
+            calls_to_stdout,
         }
+    }
+
+    fn emit_rate_log(&self, conn: &rusqlite::Connection) {
+        if self.silent { return; }
+        let rest = latest_remaining(conn, "rest");
+        let graphql = latest_remaining(conn, "graphql");
+        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        println!("{}", serde_json::json!({
+            "ts": ts,
+            "gh_points_rest_remaining": rest,
+            "gh_points_graphql_remaining": graphql,
+        }));
     }
 }
 
@@ -206,6 +222,18 @@ impl GitHubClient for GhClient {
                 duration_ms: Some(duration_ms as i64),
             },
         )?;
+        if self.calls_to_stdout {
+            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            println!("{}", serde_json::json!({
+                "ts": ts,
+                "api_type": "rest",
+                "endpoint": req.endpoint,
+                "status": status,
+                "rate_remaining": resp.rate_remaining(),
+                "duration_ms": duration_ms,
+            }));
+        }
+        self.emit_rate_log(conn);
 
         db::set_poll_state(
             conn,
@@ -271,9 +299,30 @@ impl GitHubClient for GhClient {
                 duration_ms: Some(duration_ms as i64),
             },
         )?;
+        if self.calls_to_stdout {
+            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            println!("{}", serde_json::json!({
+                "ts": ts,
+                "api_type": "graphql",
+                "endpoint": endpoint,
+                "status": status,
+                "rate_remaining": gql_remaining.or(header_remaining),
+                "gql_cost": gql_cost,
+                "duration_ms": duration_ms,
+            }));
+        }
+        self.emit_rate_log(conn);
 
         Ok(body["data"].clone())
     }
+}
+
+fn latest_remaining(conn: &rusqlite::Connection, api_type: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT rate_remaining FROM call_log WHERE api_type = ?1 AND rate_remaining IS NOT NULL ORDER BY id DESC LIMIT 1",
+        rusqlite::params![api_type],
+        |r| r.get(0),
+    ).ok()
 }
 
 /// Parse the `--include` output: HTTP status line + headers, blank line, body.
@@ -505,7 +554,7 @@ mod tests {
     #[test]
     fn throttle_no_data_returns_max() {
         let conn = crate::db::open_in_memory().unwrap();
-        let client = GhClient::new("gh", 500, 50);
+        let client = GhClient::new("gh", 500, 50, false, false);
         let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
         assert_eq!(remaining, i64::MAX);
     }
@@ -527,7 +576,7 @@ mod tests {
             cache_hit: false,
             duration_ms: Some(50),
         }).unwrap();
-        let client = GhClient::new("gh", 500, 50);
+        let client = GhClient::new("gh", 500, 50, false, false);
         // Should return immediately (4800 > 500 warn threshold)
         let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
         assert_eq!(remaining, 4800);
@@ -550,7 +599,7 @@ mod tests {
             cache_hit: false,
             duration_ms: Some(50),
         }).unwrap();
-        let client = GhClient::new("gh", 500, 50);
+        let client = GhClient::new("gh", 500, 50, false, false);
         let remaining = client.throttle_if_needed(&conn, "graphql").unwrap();
         assert_eq!(remaining, i64::MAX); // no graphql calls yet
     }
