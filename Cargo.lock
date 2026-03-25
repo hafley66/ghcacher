@@ -344,6 +344,7 @@ dependencies = [
  "dirs",
  "glob",
  "inquire",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

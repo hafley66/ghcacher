@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod gh;
 mod output;
+mod pidfile;
 mod query;
 mod setup;
 mod sync;
@@ -100,9 +101,11 @@ enum Cmd {
         Also starts the HTTP command server on 127.0.0.1:{cmd_port} (default 7748).\n\
         Endpoints: GET /events (SSE), POST /subscribe, POST /heartbeat, POST /pause, POST /resume.\n\n\
         --no-sync: start the HTTP server only; skip the sync loop entirely.\n\
-        --daemon is not yet implemented.")]
+        --daemon: double-fork to background, redirect stdio to /dev/null. \
+        A pidfile is written next to the database (gh.pid) and checked on startup \
+        to prevent duplicate instances.")]
     Watch {
-        /// Fork to background (not yet implemented)
+        /// Fork to background; write pidfile next to the database
         #[arg(long)]
         daemon: bool,
         /// Start HTTP server only; skip sync loop
@@ -149,6 +152,14 @@ fn main() -> Result<()> {
         _ => config::load(cli.config.as_deref())?,
     };
 
+    // Daemonize before tracing init so stdio redirect happens first.
+    if matches!(cli.cmd, Cmd::Watch { daemon: true, .. }) {
+        #[cfg(unix)]
+        pidfile::daemonize()?;
+        #[cfg(not(unix))]
+        anyhow::bail!("--daemon is not supported on this platform");
+    }
+
     let level = cfg.log_level.parse().unwrap_or(tracing::Level::INFO);
     tracing_subscriber::fmt()
         .with_max_level(level)
@@ -172,10 +183,9 @@ fn main() -> Result<()> {
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
             sync::run(&conn, &gh, &cfg, filter, true, &[], &[])
         }
-        Cmd::Watch { daemon, no_sync } => {
-            if daemon {
-                anyhow::bail!("--daemon not yet implemented");
-            }
+        Cmd::Watch { daemon: _, no_sync } => {
+            let pid_path = cfg.db_path.with_extension("pid");
+            let _pid = pidfile::PidFile::acquire(&pid_path)?;
             let conn = db::open(&cfg.db_path)?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold, cli.silent, cli.calls_to_stdout);
             let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

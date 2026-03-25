@@ -242,7 +242,9 @@ Runs `checkout` for repos with `checkout_on_sync = true` after each sync pass.
 Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below). Pass `--no-sync` to run
 the HTTP server only, with no sync loop.
 
-`--daemon` (background fork) is not yet implemented.
+`--daemon` double-forks to background and redirects stdio to `/dev/null`. A pidfile is written
+next to the database (`gh.pid`) on every `watch` start -- daemon or not -- and checked to prevent
+duplicate instances. A stale pidfile (dead process) is silently overwritten.
 
 ### `ghcache checkout <owner/name> <branch>`
 Clone or update a single branch into `staging_folder`.
