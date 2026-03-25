@@ -4,11 +4,11 @@ use rusqlite::Connection;
 use crate::output::Format;
 use super::sql;
 
-pub fn query(conn: &Connection, _mark_read: bool, format: Format) -> Result<()> {
-    // mark_read would call `gh api --method PATCH /notifications/threads/{id}` for each
-    // Not yet implemented -- would need gh client passed in
-    if _mark_read {
-        tracing::warn!("--mark-read not yet implemented");
+pub fn query(conn: &Connection, mark_read: bool, format: Format) -> Result<()> {
+    if mark_read {
+        // Would call `gh api --method PATCH /notifications/threads/{id}` for each unread row.
+        // Requires gh client access; not yet implemented.
+        anyhow::bail!("--mark-read is not yet implemented");
     }
     sql::query_view(conn, "v_unread_notifications", format)
 }

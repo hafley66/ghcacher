@@ -56,10 +56,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Interactive TUI setup -- guided config creation + initial sync
-    #[command(long_about = "Launches a terminal form (requires ghcache-init on PATH or next to \
-        the ghcache binary) to collect your GitHub account details, writes ghcache.toml, \
-        and runs the initial sync automatically.\n\n\
-        Build the form: cd init-form && go build -o ghcache-init .")]
+    #[command(long_about = "Interactive terminal prompts to collect your GitHub account details, \
+        write ghcache.toml, and run the initial sync automatically.\n\n\
+        To write the config to a custom path:\n  \
+          ghcache --config ~/.config/ghcache/config.toml setup\n\n\
+        The optional ghcache-init companion binary (Go + Charm huh) provides a richer form UI \
+        as an alternative. Build it: cd init-form && go build -o ghcache-init .")]
     Setup,
     /// Write a config template to ghcache.toml (non-interactive)
     Init,

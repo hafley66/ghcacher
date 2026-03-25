@@ -6,7 +6,7 @@ GitHub data is synced into SQLite; local tools query SQLite directly -- no live 
 ## Quick start
 
 ```sh
-# Option A: guided TUI (requires ghcache-init -- see Setup below)
+# Option A: guided TUI
 ghcache setup
 
 # Option B: manual
@@ -18,29 +18,37 @@ ghcache watch         # continuous polling loop
 
 ## Setup (guided TUI)
 
-`ghcache setup` runs an interactive terminal form and writes `ghcache.toml` for you.
-It requires the `ghcache-init` companion binary (Go + Charm huh):
+`ghcache setup` runs interactive terminal prompts, writes `ghcache.toml`, and runs the initial sync.
+
+```sh
+ghcache setup
+
+# Write the config to a custom path:
+ghcache --config ~/.config/ghcache/config.toml setup
+```
+
+The `ghcache-init` companion binary (Go + Charm huh) provides a richer multi-step form as an
+alternative. It is not required -- setup works without it.
 
 ```sh
 cd init-form
 go build -o ghcache-init .
-# Put it next to the ghcache binary, or on PATH:
-cp ghcache-init /usr/local/bin/
+cp ghcache-init /usr/local/bin/   # or next to the ghcache binary
 ```
 
-Then:
-```sh
-ghcache setup          # launches the form, writes ghcache.toml, runs initial sync
-```
-
-To write the config somewhere other than `./ghcache.toml`:
-```sh
-ghcache --config ~/.config/ghcache/config.toml setup
-```
+`ghcache-init` outputs JSON to stdout; pipe it wherever you like, or use it standalone to
+generate config JSON for scripted setups.
 
 ## Demo (copy-paste)
 
-Replace `yourname` with your GitHub login (`gh api user --jq '.login'`).
+`demo.sh` in the repo root runs the full demo automatically (builds the binary, writes a temp config
+for an org, syncs, queries, and confirms 304 cache hits on the second pass). Just run it:
+
+```sh
+./demo.sh
+```
+
+Or step through it manually. Replace `yourname` with your GitHub login (`gh api user --jq '.login'`).
 
 **1. Write a throw-away config**
 
@@ -231,10 +239,10 @@ Continuous polling loop. First iteration is a full sweep; subsequent iterations 
 
 Runs `checkout` for repos with `checkout_on_sync = true` after each sync pass.
 
-Also starts the HTTP command server (see below). Pass `--no-sync` to run the HTTP server only,
-with no sync loop.
+Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below). Pass `--no-sync` to run
+the HTTP server only, with no sync loop.
 
-`--daemon` is not yet implemented.
+`--daemon` (background fork) is not yet implemented.
 
 ### `ghcache checkout <owner/name> <branch>`
 Clone or update a single branch into `staging_folder`.
@@ -253,6 +261,18 @@ Requires `staging_folder` in config. Requires the repo to exist in the DB (run `
 
 ### `ghcache query <subcommand>`
 Query cached data from SQLite without hitting the GitHub API.
+
+| Subcommand | Key flags | Notes |
+|------------|-----------|-------|
+| `prs` | `--repo owner/name`, `--state open\|closed\|merged`, `--needs-review`, `--mine` | `--mine` resolves current user via `gh api user` |
+| `pr <number> --repo owner/name` | | Single PR with reviews, comments, labels |
+| `notifications` | `--mark-read` | `--mark-read` is not yet implemented |
+| `events` | `--repo owner/name`, `--type <type>` | |
+| `branches` | `--repo owner/name` | |
+| `rate-limit` | | Last 50 API calls with rate info |
+| `sql '<query>'` | | Raw SQL passthrough |
+
+All subcommands accept `--format json\|json-pretty\|tsv\|table` (default: table on TTY, JSON when piped).
 
 ### `ghcache status`
 Shows DB size, PR count, unread notification count, and recent poll state per endpoint.

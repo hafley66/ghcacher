@@ -51,9 +51,16 @@ pub fn query(
         );
     }
 
-    // `mine` would need the current gh user -- skip for now, document limitation
     if mine {
-        tracing::warn!("--mine requires knowing current gh user; not yet implemented");
+        match std::process::Command::new("gh").args(["api", "user", "--jq", ".login"]).output() {
+            Ok(out) if out.status.success() => {
+                let login = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !login.is_empty() {
+                    conditions.push(format!("pr.author = '{}'", login.replace('\'', "''")));
+                }
+            }
+            _ => tracing::warn!("--mine: could not resolve gh user; ignoring filter"),
+        }
     }
 
     let where_clause = conditions.join(" AND ");
