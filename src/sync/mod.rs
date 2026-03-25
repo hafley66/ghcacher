@@ -37,23 +37,21 @@ impl SyncFilter {
     }
 }
 
+/// Sentinel stored in poll_state.etag when we've confirmed owner is a user, not an org.
+const NOT_ORG: &str = "__user__";
+
 /// Discover all repo names under a GitHub org or user account.
 /// Tries /orgs/{owner}/repos first; falls back to /users/{owner}/repos on 404.
+/// The 404 result is memoized in poll_state so the org probe only fires once.
 /// ETag-gated and paginated -- typically a free 304 after the first call.
 fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> Result<Vec<String>> {
     let org_endpoint = format!("/orgs/{owner}/repos");
     let user_endpoint = format!("/users/{owner}/repos");
 
     let poll = db::get_poll_state(conn, &org_endpoint)?;
-    let mut req = GhRequest::get(&org_endpoint).paginated();
-    if let Some(ref etag) = poll.etag {
-        req = req.with_etag(etag);
-    }
 
-    let resp = gh.call(conn, &req)?;
-
-    let body = if resp.status == 404 {
-        // Not an org account; try the user endpoint.
+    let body = if poll.etag.as_deref() == Some(NOT_ORG) {
+        // Already confirmed this owner is a user account; skip the org probe.
         let poll2 = db::get_poll_state(conn, &user_endpoint)?;
         let mut req2 = GhRequest::get(&user_endpoint).paginated();
         if let Some(ref etag) = poll2.etag {
@@ -64,10 +62,31 @@ fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> 
             return Ok(vec![]);
         }
         resp2.body
-    } else if resp.is_not_modified() {
-        return Ok(vec![]);
     } else {
-        resp.body
+        let mut req = GhRequest::get(&org_endpoint).paginated();
+        if let Some(ref etag) = poll.etag {
+            req = req.with_etag(etag);
+        }
+        let resp = gh.call(conn, &req)?;
+
+        if resp.status == 404 {
+            // Not an org account; memoize so we skip this probe on future polls.
+            db::set_poll_state(conn, &org_endpoint, Some(NOT_ORG), None, None, false)?;
+            let poll2 = db::get_poll_state(conn, &user_endpoint)?;
+            let mut req2 = GhRequest::get(&user_endpoint).paginated();
+            if let Some(ref etag) = poll2.etag {
+                req2 = req2.with_etag(etag);
+            }
+            let resp2 = gh.call(conn, &req2)?;
+            if resp2.is_not_modified() {
+                return Ok(vec![]);
+            }
+            resp2.body
+        } else if resp.is_not_modified() {
+            return Ok(vec![]);
+        } else {
+            resp.body
+        }
     };
 
     let names: Vec<String> = body
