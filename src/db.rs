@@ -74,11 +74,12 @@ pub struct PollState {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub poll_interval: Option<i64>,
+    pub last_polled_at: Option<String>,
 }
 
 pub fn get_poll_state(conn: &Connection, endpoint: &str) -> Result<PollState> {
     let mut stmt = conn.prepare_cached(
-        "SELECT etag, last_modified, poll_interval FROM poll_state WHERE endpoint = ?1",
+        "SELECT etag, last_modified, poll_interval, last_polled_at FROM poll_state WHERE endpoint = ?1",
     )?;
     let mut rows = stmt.query(params![endpoint])?;
     if let Some(row) = rows.next()? {
@@ -86,9 +87,10 @@ pub fn get_poll_state(conn: &Connection, endpoint: &str) -> Result<PollState> {
             etag: row.get(0)?,
             last_modified: row.get(1)?,
             poll_interval: row.get(2)?,
+            last_polled_at: row.get(3)?,
         })
     } else {
-        Ok(PollState { etag: None, last_modified: None, poll_interval: None })
+        Ok(PollState { etag: None, last_modified: None, poll_interval: None, last_polled_at: None })
     }
 }
 

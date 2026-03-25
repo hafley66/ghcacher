@@ -11,6 +11,17 @@ pub fn sync(conn: &Connection, gh: &dyn GitHubClient, repo_id: i64, owner: &str,
     let endpoint = format!("/repos/{owner}/{name}/events");
     let poll = db::get_poll_state(conn, &endpoint)?;
 
+    // Respect X-Poll-Interval from previous response.
+    if let (Some(interval), Some(ref last_polled)) = (poll.poll_interval, &poll.last_polled_at) {
+        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_polled) {
+            let elapsed = chrono::Utc::now().signed_duration_since(last).num_seconds();
+            if elapsed < interval {
+                tracing::debug!(repo = %format!("{owner}/{name}"), elapsed, interval, "events: skipping, poll interval not elapsed");
+                return Ok(vec![]);
+            }
+        }
+    }
+
     let mut req = GhRequest::get(&endpoint).paginated();
     if let Some(ref etag) = poll.etag {
         req = req.with_etag(etag);
