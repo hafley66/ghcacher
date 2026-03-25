@@ -355,4 +355,4 @@ Progressive back-off increases sleep duration as capacity drops further.
 - Events API is the cheapest signal: one paginated REST call reveals which PR numbers changed
 - Those PR numbers are batched into a single aliased GraphQL query per repo (targeted sync)
 - `change_log` is an append-only table; the HTTP `/events` SSE endpoint tails it and pushes rows to subscribers
-- `ghcache-client` is a companion Rust library with typed queries and an `EventStream` for the SSE feed
+- `ghcache-client` is a companion Rust library with typed queries and an `EventStream` for the SSE feed -- see [ghcache-client/README.md](ghcache-client/README.md)
