@@ -1,6 +1,8 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -91,6 +93,91 @@ impl Subscriber {
                 last_id = events.last().map(|e| e.id).unwrap_or(last_id);
                 handler(events)?;
             }
+        }
+    }
+}
+
+/// Connects to `GET /events` on the ghcache HTTP server and delivers
+/// change events as they arrive. Sends `Last-Event-ID` on connect so the
+/// server replays any rows the client missed since its last-seen id.
+///
+/// Blocks until the connection drops or `handler` returns `Err`.
+///
+/// Example:
+/// ```no_run
+/// ghcache_client::EventStream::new(7748)
+///     .subscribe(|ev| {
+///         println!("{:?}", ev);
+///         Ok(())
+///     });
+/// ```
+pub struct EventStream {
+    port: u16,
+    last_id: i64,
+}
+
+impl EventStream {
+    pub fn new(port: u16) -> Self {
+        EventStream { port, last_id: 0 }
+    }
+
+    /// Resume from a known last-seen change_log id (server replays missed rows).
+    pub fn from_id(port: u16, last_id: i64) -> Self {
+        EventStream { port, last_id }
+    }
+
+    pub fn subscribe<F>(self, mut handler: F) -> Result<()>
+    where
+        F: FnMut(ChangeEvent) -> Result<()>,
+    {
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", self.port))
+            .map_err(|e| anyhow::anyhow!("connect to ghcache on port {}: {e}", self.port))?;
+
+        {
+            use std::io::Write;
+            let mut w = &stream;
+            let req = format!(
+                "GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\nLast-Event-ID: {}\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+                self.last_id
+            );
+            w.write_all(req.as_bytes())?;
+        }
+
+        let mut reader = BufReader::new(&stream);
+
+        // Discard HTTP response headers.
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+
+        let mut current_id: Option<i64> = None;
+        let mut current_data = String::new();
+
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
+                anyhow::bail!("SSE stream closed by server");
+            }
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+
+            if let Some(rest) = trimmed.strip_prefix("id:") {
+                current_id = rest.trim().parse().ok();
+            } else if let Some(rest) = trimmed.strip_prefix("data:") {
+                current_data = rest.trim().to_string();
+            } else if trimmed.is_empty() && !current_data.is_empty() {
+                if let Ok(ev) = serde_json::from_str::<ChangeEvent>(&current_data) {
+                    handler(ev)?;
+                }
+                current_data.clear();
+                current_id = None;
+            }
+            // comment lines (start with ':') and unknown fields are ignored
+            let _ = current_id;
         }
     }
 }

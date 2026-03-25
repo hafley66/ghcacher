@@ -90,7 +90,7 @@ impl RepoConfig {
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub db_path: PathBuf,
-    pub staging_folder: Option<PathBuf>,
+    pub staging_folder: PathBuf,
     pub poll_interval_seconds: u64,
     pub log_level: String,
     pub gh_binary: String,
@@ -154,12 +154,11 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         .global
         .staging_folder
         .as_deref()
-        .map(expand_tilde);
-    if let Some(ref sf) = staging_folder {
-        if !sf.exists() {
-            std::fs::create_dir_all(sf)
-                .with_context(|| format!("creating staging_folder {}", sf.display()))?;
-        }
+        .map(expand_tilde)
+        .ok_or_else(|| anyhow::anyhow!("staging_folder is required in [global] config"))?;
+    if !staging_folder.exists() {
+        std::fs::create_dir_all(&staging_folder)
+            .with_context(|| format!("creating staging_folder {}", staging_folder.display()))?;
     }
 
     Ok(ResolvedConfig {
@@ -204,6 +203,7 @@ mod tests {
             r#"
 [global]
 db_path = "/tmp/test.db"
+staging_folder = "/tmp/ghcache_test_staging"
 
 [[repo]]
 owner = "myorg"
@@ -223,10 +223,27 @@ name = "backend"
             r#"
 [global]
 db_path = "/tmp/test.db"
+staging_folder = "/tmp/ghcache_test_staging"
 "#,
         );
         let err = load(Some(f.path())).unwrap_err();
         assert!(err.to_string().contains("[[repo]]"));
+    }
+
+    #[test]
+    fn fails_without_staging_folder() {
+        let f = write_config(
+            r#"
+[global]
+db_path = "/tmp/test.db"
+
+[[repo]]
+owner = "myorg"
+name = "backend"
+"#,
+        );
+        let err = load(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("staging_folder is required"));
     }
 
     #[test]
@@ -235,6 +252,7 @@ db_path = "/tmp/test.db"
             r#"
 [global]
 db_path = "/nonexistent/path/gh.db"
+staging_folder = "/tmp/ghcache_test_staging"
 
 [[repo]]
 owner = "myorg"
@@ -307,6 +325,7 @@ name = "backend"
             r#"
 [global]
 db_path = "/tmp/test.db"
+staging_folder = "/tmp/ghcache_test_staging"
 poll_interval_seconds = 60
 
 [[repo]]

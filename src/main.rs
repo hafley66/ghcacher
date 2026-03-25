@@ -5,11 +5,10 @@ mod db;
 mod gh;
 mod output;
 mod query;
-mod serve;
 mod setup;
 mod sync;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -86,21 +85,14 @@ enum Cmd {
         /// Fork to background (not yet implemented)
         #[arg(long)]
         daemon: bool,
+        /// Start HTTP server only; skip sync loop
+        #[arg(long)]
+        no_sync: bool,
     },
     /// Query cached data
     Query {
         #[command(subcommand)]
         sub: query::QueryCmd,
-    },
-    /// Broadcast change_log rows as NDJSON over a Unix socket
-    #[command(long_about = "Tails change_log and broadcasts new rows as NDJSON to all connected \
-        Unix socket subscribers.\n\n\
-        Default socket: $XDG_RUNTIME_DIR/ghcache.sock or /tmp/ghcache.sock.\n\
-        Use ghcache-client for a typed Rust subscriber.")]
-    Serve {
-        /// Unix socket path (default: $XDG_RUNTIME_DIR/ghcache.sock or /tmp/ghcache.sock)
-        #[arg(long)]
-        socket: Option<std::path::PathBuf>,
     },
     /// Clone or update a branch into staging_folder
     #[command(long_about = "Clone or update a branch into staging_folder.\n\n\
@@ -158,46 +150,43 @@ fn main() -> Result<()> {
             let conn = db::open(&cfg.db_path)?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
-            sync::run(&conn, &gh, &cfg, filter, true, &[])
+            sync::run(&conn, &gh, &cfg, filter, true, &[], &[])
         }
-        Cmd::Watch { daemon } => {
+        Cmd::Watch { daemon, no_sync } => {
             if daemon {
                 anyhow::bail!("--daemon not yet implemented");
             }
             let conn = db::open(&cfg.db_path)?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
-            let subs = if let Some(ref staging) = cfg.staging_folder {
+            let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let subs = {
                 let subs = cmd::Subscriptions::new(std::time::Duration::from_secs(cfg.heartbeat_ttl_seconds));
                 let subs_server = std::sync::Arc::clone(&subs);
-                let staging = staging.clone();
+                let staging = cfg.staging_folder.clone();
+                let db_path = cfg.db_path.clone();
                 let port = cfg.cmd_port;
+                let paused_server = std::sync::Arc::clone(&paused);
                 std::thread::spawn(move || {
-                    if let Err(e) = cmd::run(subs_server, staging, port) {
+                    if let Err(e) = cmd::run(subs_server, staging, db_path, port, paused_server) {
                         tracing::error!(error = %e, "cmd server exited");
                     }
                 });
                 Some(subs)
-            } else {
-                tracing::info!("staging_folder not set; cmd server disabled");
-                None
             };
-            sync::watch(&conn, &gh, &cfg, subs)
+            if no_sync {
+                tracing::info!("--no-sync: HTTP server running, sync loop disabled");
+                loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+            }
+            sync::watch(&conn, &gh, &cfg, subs, paused)
         }
         Cmd::Query { sub } => {
             let conn = db::open(&cfg.db_path)?;
             query::run(&conn, sub)
         }
-        Cmd::Serve { socket } => {
-            let conn = db::open(&cfg.db_path)?;
-            let path = socket.unwrap_or_else(serve::default_socket_path);
-            serve::run(&conn, &path)
-        }
         Cmd::Checkout { repo, branch } => {
-            let staging = cfg.staging_folder.as_deref()
-                .ok_or_else(|| anyhow::anyhow!("staging_folder not set in config"))?;
             let conn = db::open(&cfg.db_path)?;
             let (owner, name) = checkout::parse_slug(&repo)?;
-            checkout::checkout_one(&conn, staging, &owner, &name, &branch)
+            checkout::checkout_one(&conn, &cfg.staging_folder, &owner, &name, &branch)
         }
     }
 }
@@ -227,24 +216,26 @@ exclude       = []
 # sync_events    = true
 # sync_branches  = ["main", "staging"]
 "#;
-    let path = PathBuf::from("ghcache.toml");
+    let path = dirs::config_dir()
+        .map(|d| d.join("ghcache").join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("ghcache.toml"));
+
     if path.exists() {
-        anyhow::bail!("ghcache.toml already exists");
+        anyhow::bail!("{} already exists", path.display());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(&path, template)?;
-    println!("Created ghcache.toml -- edit repos then run: ghcache sync");
+    println!("Created {}", path.display());
+    println!("Edit the [[org]] / [[repo]] entries then run: ghcache sync");
     Ok(())
 }
 
 fn cmd_config(cfg: &config::ResolvedConfig) -> Result<()> {
     println!("db_path:          {}", cfg.db_path.display());
-    println!(
-        "staging_folder:   {}",
-        cfg.staging_folder
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(not set)".into())
-    );
+    println!("staging_folder:   {}", cfg.staging_folder.display());
     println!("poll_interval:    {}s", cfg.poll_interval_seconds);
     println!("log_level:        {}", cfg.log_level);
     println!("gh_binary:        {}", cfg.gh_binary);

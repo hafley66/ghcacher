@@ -7,7 +7,14 @@ use crate::gh::{GitHubClient, GhRequest};
 
 const ENDPOINT: &str = "/notifications";
 
-pub fn sync(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> Result<()> {
+/// `extra_slugs` are (owner, name) pairs from active subscriptions with
+/// `notifications: true` that are not in cfg.repos.
+pub fn sync(
+    conn: &Connection,
+    gh: &dyn GitHubClient,
+    cfg: &ResolvedConfig,
+    extra_slugs: &[(String, String)],
+) -> Result<()> {
     let poll = db::get_poll_state(conn, ENDPOINT)?;
 
     let mut req = GhRequest::get(ENDPOINT);
@@ -27,13 +34,16 @@ pub fn sync(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> R
         None => return Ok(()),
     };
 
-    // Build set of repo slugs we care about
-    let tracked_slugs: std::collections::HashSet<String> = cfg
+    // Build set of repo slugs we care about (config + active subscriptions).
+    let mut tracked_slugs: std::collections::HashSet<String> = cfg
         .repos
         .iter()
         .filter(|r| r.sync_notifications.unwrap_or(false))
         .map(|r| format!("{}/{}", r.owner, r.name))
         .collect();
+    for (owner, name) in extra_slugs {
+        tracked_slugs.insert(format!("{owner}/{name}"));
+    }
 
     // Preload repo_id map and existing gh_ids so upsert_notification needs no
     // per-row SELECTs.
