@@ -1,4 +1,5 @@
 mod checkout;
+mod cmd;
 mod config;
 mod db;
 mod gh;
@@ -157,7 +158,7 @@ fn main() -> Result<()> {
             let conn = db::open(&cfg.db_path)?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
-            sync::run(&conn, &gh, &cfg, filter, true)
+            sync::run(&conn, &gh, &cfg, filter, true, &[])
         }
         Cmd::Watch { daemon } => {
             if daemon {
@@ -165,7 +166,22 @@ fn main() -> Result<()> {
             }
             let conn = db::open(&cfg.db_path)?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold);
-            sync::watch(&conn, &gh, &cfg)
+            let subs = if let Some(ref staging) = cfg.staging_folder {
+                let subs = cmd::Subscriptions::new(std::time::Duration::from_secs(cfg.heartbeat_ttl_seconds));
+                let subs_server = std::sync::Arc::clone(&subs);
+                let staging = staging.clone();
+                let port = cfg.cmd_port;
+                std::thread::spawn(move || {
+                    if let Err(e) = cmd::run(subs_server, staging, port) {
+                        tracing::error!(error = %e, "cmd server exited");
+                    }
+                });
+                Some(subs)
+            } else {
+                tracing::info!("staging_folder not set; cmd server disabled");
+                None
+            };
+            sync::watch(&conn, &gh, &cfg, subs)
         }
         Cmd::Query { sub } => {
             let conn = db::open(&cfg.db_path)?;

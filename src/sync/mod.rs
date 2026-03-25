@@ -104,7 +104,14 @@ fn org_to_repos(org: &OrgConfig, names: Vec<String>) -> Vec<RepoConfig> {
 /// `full_sweep` forces a full GraphQL fetch of all open PRs instead of
 /// using event hints to target only changed PRs. Always true for one-shot
 /// `ghcache sync`; true only on the first iteration of `ghcache watch`.
-pub fn run(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig, filter: SyncFilter, full_sweep: bool) -> Result<()> {
+pub fn run(
+    conn: &Connection,
+    gh: &dyn GitHubClient,
+    cfg: &ResolvedConfig,
+    filter: SyncFilter,
+    full_sweep: bool,
+    extra_repos: &[RepoConfig],
+) -> Result<()> {
     // Expand [[org]] entries into synthetic RepoConfigs.
     let mut org_repos: Vec<RepoConfig> = vec![];
     for org in &cfg.orgs {
@@ -114,7 +121,7 @@ pub fn run(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig, filte
         }
     }
 
-    let all_repos: Vec<&RepoConfig> = cfg.repos.iter().chain(org_repos.iter()).collect();
+    let all_repos: Vec<&RepoConfig> = cfg.repos.iter().chain(org_repos.iter()).chain(extra_repos.iter()).collect();
 
     for repo in all_repos {
         if let Some(ref slug) = filter.repo {
@@ -173,7 +180,12 @@ pub fn run(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig, filte
     Ok(())
 }
 
-pub fn watch(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> Result<()> {
+pub fn watch(
+    conn: &Connection,
+    gh: &dyn GitHubClient,
+    cfg: &ResolvedConfig,
+    subs: Option<std::sync::Arc<crate::cmd::Subscriptions>>,
+) -> Result<()> {
     tracing::info!("starting watch loop");
     let mut first_run = true;
     loop {
@@ -183,7 +195,34 @@ pub fn watch(conn: &Connection, gh: &dyn GitHubClient, cfg: &ResolvedConfig) -> 
             notifs_only: false,
             events_only: false,
         };
-        if let Err(e) = run(conn, gh, cfg, filter, first_run) {
+
+        // Repos subscribed via the cmd server that aren't already in config.
+        let extra_repos: Vec<RepoConfig> = subs
+            .as_ref()
+            .map(|s| {
+                s.active_pr_sync_repos()
+                    .into_iter()
+                    .filter(|(o, n)| !cfg.repos.iter().any(|r| &r.owner == o && &r.name == n))
+                    .map(|(owner, name)| RepoConfig {
+                        owner,
+                        name,
+                        default_branch: None,
+                        sync_prs: Some(true),
+                        sync_notifications: None,
+                        sync_events: None,
+                        sync_branches: None,
+                        checkout_on_sync: None,
+                        poll_interval_seconds: None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !extra_repos.is_empty() {
+            tracing::debug!(count = extra_repos.len(), "syncing subscription repos");
+        }
+
+        if let Err(e) = run(conn, gh, cfg, filter, first_run, &extra_repos) {
             tracing::error!(error = %e, "watch sync error");
         }
         first_run = false;
@@ -256,6 +295,8 @@ mod tests {
             gh_binary: "gh".into(),
             rate_warn_threshold: 500,
             rate_stop_threshold: 50,
+            cmd_port: 7748,
+            heartbeat_ttl_seconds: 30,
             repos: vec![RepoConfig {
                 owner: owner.into(),
                 name: name.into(),
@@ -284,7 +325,7 @@ mod tests {
         mock.push_rest(serde_json::json!([]));
         mock.push_graphql(serde_json::json!({"repository": {"pullRequests": {"nodes": []}}}));
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), true).unwrap();
+        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), true, &[]).unwrap();
 
         assert_eq!(mock.graphql_call_count(), 1);
         let (endpoint, _) = &mock.graphql_calls.borrow()[0];
@@ -298,7 +339,7 @@ mod tests {
         let mock = MockGhClient::new();
         mock.push_rest_304(); // events 304
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false).unwrap();
+        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[]).unwrap();
 
         assert_eq!(mock.graphql_call_count(), 0);
     }
@@ -318,7 +359,7 @@ mod tests {
         // targeted graphql call returns empty repo (no PRs to upsert)
         mock.push_graphql(serde_json::json!({"repository": {}}));
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false).unwrap();
+        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[]).unwrap();
 
         assert_eq!(mock.graphql_call_count(), 1, "expected exactly 1 batched graphql call");
         let (endpoint, query) = &mock.graphql_calls.borrow()[0];
@@ -337,7 +378,7 @@ mod tests {
              "payload": {"ref": "refs/heads/main"}, "created_at": "2026-01-01T00:00:00Z"},
         ]));
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false).unwrap();
+        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[]).unwrap();
 
         assert_eq!(mock.graphql_call_count(), 0);
     }

@@ -23,6 +23,10 @@ pub struct Global {
     pub rate_warn_threshold: Option<i64>,
     /// REST + GraphQL remaining-calls count below which polling stops until reset (default 50).
     pub rate_stop_threshold: Option<i64>,
+    /// Port for the cmd HTTP server on 127.0.0.1 (default 7748).
+    pub cmd_port: Option<u16>,
+    /// Seconds before a subscriber UUID is considered expired (default 30).
+    pub heartbeat_ttl_seconds: Option<u64>,
 }
 
 impl Default for Global {
@@ -35,6 +39,8 @@ impl Default for Global {
             gh_binary: Some("gh".into()),
             rate_warn_threshold: Some(500),
             rate_stop_threshold: Some(50),
+            cmd_port: Some(7748),
+            heartbeat_ttl_seconds: Some(30),
         }
     }
 }
@@ -90,6 +96,8 @@ pub struct ResolvedConfig {
     pub gh_binary: String,
     pub rate_warn_threshold: i64,
     pub rate_stop_threshold: i64,
+    pub cmd_port: u16,
+    pub heartbeat_ttl_seconds: u64,
     pub repos: Vec<RepoConfig>,
     pub orgs: Vec<OrgConfig>,
 }
@@ -149,7 +157,8 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         .map(expand_tilde);
     if let Some(ref sf) = staging_folder {
         if !sf.exists() {
-            tracing::warn!(path = %sf.display(), "staging_folder does not exist");
+            std::fs::create_dir_all(sf)
+                .with_context(|| format!("creating staging_folder {}", sf.display()))?;
         }
     }
 
@@ -161,6 +170,8 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         gh_binary: config.global.gh_binary.unwrap_or_else(|| "gh".into()),
         rate_warn_threshold: config.global.rate_warn_threshold.unwrap_or(500),
         rate_stop_threshold: config.global.rate_stop_threshold.unwrap_or(50),
+        cmd_port: config.global.cmd_port.unwrap_or(7748),
+        heartbeat_ttl_seconds: config.global.heartbeat_ttl_seconds.unwrap_or(30),
         repos: config.repos,
         orgs: config.orgs,
     })
