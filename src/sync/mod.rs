@@ -59,7 +59,7 @@ fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> 
         }
         let resp2 = gh.call(conn, &req2)?;
         if resp2.is_not_modified() {
-            return Ok(vec![]);
+            return repos_from_db(conn, owner);
         }
         resp2.body
     } else {
@@ -79,11 +79,11 @@ fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> 
             }
             let resp2 = gh.call(conn, &req2)?;
             if resp2.is_not_modified() {
-                return Ok(vec![]);
+                return repos_from_db(conn, owner);
             }
             resp2.body
         } else if resp.is_not_modified() {
-            return Ok(vec![]);
+            return repos_from_db(conn, owner);
         } else {
             resp.body
         }
@@ -99,6 +99,16 @@ fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> 
         .unwrap_or_default();
 
     tracing::info!(owner, count = names.len() as u64, "discovered org repos");
+    Ok(names)
+}
+
+/// Return repo names already stored in the DB for this owner.
+/// Used when the repo-list endpoint returns 304 (list unchanged).
+fn repos_from_db(conn: &Connection, owner: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached("SELECT name FROM repo WHERE owner = ?1 ORDER BY name")?;
+    let names: Vec<String> = stmt
+        .query_map(rusqlite::params![owner], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(names)
 }
 
