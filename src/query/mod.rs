@@ -37,11 +37,23 @@ pub enum QueryCmd {
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
-    /// List unread notifications
+    /// List notifications
     Notifications {
         /// Also mark as read via API
         #[arg(long)]
         mark_read: bool,
+        /// Show all notifications, not just unread
+        #[arg(long)]
+        all: bool,
+        /// Filter by repo (owner/name)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by reason (e.g. review_requested, mention, author)
+        #[arg(long)]
+        reason: Option<String>,
+        /// Filter by subject type (PullRequest, Issue, Commit, Release)
+        #[arg(long, name = "type")]
+        subject_type: Option<String>,
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
@@ -82,8 +94,8 @@ pub fn run(conn: &Connection, cmd: QueryCmd) -> Result<()> {
         QueryCmd::Pr { number, repo, format } => {
             prs::query_one(conn, number, &repo, format.unwrap_or_else(Format::auto))
         }
-        QueryCmd::Notifications { mark_read, format } => {
-            notifications::query(conn, mark_read, format.unwrap_or_else(Format::auto))
+        QueryCmd::Notifications { mark_read, all, repo, reason, subject_type, format } => {
+            notifications::query(conn, mark_read, all, repo.as_deref(), reason.as_deref(), subject_type.as_deref(), format.unwrap_or_else(Format::auto))
         }
         QueryCmd::Events { repo, r#type, format } => {
             events::query(conn, repo.as_deref(), r#type.as_deref(), format.unwrap_or_else(Format::auto))

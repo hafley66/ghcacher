@@ -148,6 +148,7 @@ staging_folder       = "~/.local/share/ghcache/repos"  # git checkouts live here
 poll_interval_seconds = 60
 log_level            = "info"            # trace | debug | info | warn | error
 gh_binary            = "gh"
+sync_notifications   = false             # sync the authenticated user's personal notification inbox
 
 # Sync every repo under a GitHub user or org account.
 # Discovered at sync time via the GitHub repos API (ETag-gated, usually a free 304).
@@ -268,7 +269,7 @@ Query cached data from SQLite without hitting the GitHub API.
 |------------|-----------|-------|
 | `prs` | `--repo owner/name`, `--state open\|closed\|merged`, `--needs-review`, `--mine` | `--mine` resolves current user via `gh api user` |
 | `pr <number> --repo owner/name` | | Single PR with reviews, comments, labels |
-| `notifications` | `--mark-read` | `--mark-read` is not yet implemented |
+| `notifications` | `--all`, `--repo owner/name`, `--reason <reason>`, `--type <type>`, `--mark-read` | Default: unread only. `--mark-read` not yet implemented. |
 | `events` | `--repo owner/name`, `--type <type>` | |
 | `branches` | `--repo owner/name` | |
 | `rate-limit` | | Last 50 API calls with rate info |

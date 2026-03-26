@@ -35,6 +35,33 @@ fn configure(conn: &Connection) -> Result<()> {
 
 fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+    // Additive column migrations for existing databases.
+    // ALTER TABLE IF NOT EXISTS ... ADD COLUMN is not supported by older SQLite,
+    // so we ignore "duplicate column" errors.
+    for stmt in [
+        "ALTER TABLE notification ADD COLUMN subject_number INTEGER",
+        "ALTER TABLE notification ADD COLUMN html_url TEXT",
+    ] {
+        if let Err(e) = conn.execute_batch(stmt) {
+            // "duplicate column name" is the only expected failure
+            if !e.to_string().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+    }
+    // Recreate view to pick up new columns (views are not schema-migrated by CREATE IF NOT EXISTS).
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS v_unread_notifications;
+         CREATE VIEW v_unread_notifications AS
+         SELECT
+             n.gh_id, n.subject_type, n.subject_title, n.subject_number,
+             n.html_url, n.reason, n.unread, n.updated_at,
+             r.owner || '/' || r.name AS repo_slug
+         FROM notification n
+         LEFT JOIN repo r ON r.id = n.repo_id
+         WHERE n.unread = 1
+         ORDER BY n.updated_at DESC;",
+    )?;
     Ok(())
 }
 

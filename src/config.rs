@@ -27,6 +27,8 @@ pub struct Global {
     pub cmd_port: Option<u16>,
     /// Seconds before a subscriber UUID is considered expired (default 30).
     pub heartbeat_ttl_seconds: Option<u64>,
+    /// Sync the authenticated user's personal notification inbox (default false).
+    pub sync_notifications: Option<bool>,
 }
 
 impl Default for Global {
@@ -41,6 +43,7 @@ impl Default for Global {
             rate_stop_threshold: Some(50),
             cmd_port: Some(7748),
             heartbeat_ttl_seconds: Some(30),
+            sync_notifications: None,
         }
     }
 }
@@ -98,6 +101,7 @@ pub struct ResolvedConfig {
     pub rate_stop_threshold: i64,
     pub cmd_port: u16,
     pub heartbeat_ttl_seconds: u64,
+    pub sync_notifications: bool,
     pub repos: Vec<RepoConfig>,
     pub orgs: Vec<OrgConfig>,
 }
@@ -171,6 +175,7 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         rate_stop_threshold: config.global.rate_stop_threshold.unwrap_or(50),
         cmd_port: config.global.cmd_port.unwrap_or(7748),
         heartbeat_ttl_seconds: config.global.heartbeat_ttl_seconds.unwrap_or(30),
+        sync_notifications: config.global.sync_notifications.unwrap_or(false),
         repos: config.repos,
         orgs: config.orgs,
     })

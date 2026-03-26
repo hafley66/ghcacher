@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS notification (
     subject_type    TEXT NOT NULL,
     subject_title   TEXT NOT NULL,
     subject_url     TEXT,
+    subject_number  INTEGER,
+    html_url        TEXT,
     reason          TEXT NOT NULL,
     unread          INTEGER NOT NULL DEFAULT 1,
     updated_at      TEXT NOT NULL,
@@ -182,8 +184,8 @@ WHERE pr.state = 'open';
 
 CREATE VIEW IF NOT EXISTS v_unread_notifications AS
 SELECT
-    n.gh_id, n.subject_type, n.subject_title, n.reason,
-    n.updated_at,
+    n.gh_id, n.subject_type, n.subject_title, n.subject_number,
+    n.html_url, n.reason, n.unread, n.updated_at,
     r.owner || '/' || r.name AS repo_slug
 FROM notification n
 LEFT JOIN repo r ON r.id = n.repo_id

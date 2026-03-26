@@ -235,7 +235,8 @@ pub fn run(
 
     // Notifications are cross-repo, sync once.
     let notifs_needed = filter.do_notifs()
-        && (cfg.repos.iter().any(|r| r.sync_notifications.unwrap_or(false))
+        && (cfg.sync_notifications
+            || cfg.repos.iter().any(|r| r.sync_notifications.unwrap_or(false))
             || !extra_notif_slugs.is_empty());
     if notifs_needed {
         notifications::sync(conn, gh, cfg, extra_notif_slugs)?;
@@ -379,6 +380,7 @@ mod tests {
             rate_stop_threshold: 50,
             cmd_port: 7748,
             heartbeat_ttl_seconds: 30,
+            sync_notifications: false,
             repos: vec![RepoConfig {
                 owner: owner.into(),
                 name: name.into(),
@@ -484,6 +486,7 @@ mod integration {
             rate_stop_threshold: 50,
             cmd_port: 7748,
             heartbeat_ttl_seconds: 30,
+            sync_notifications: false,
             repos: vec![RepoConfig {
                 owner: "hafley66".into(),
                 name: "cc-hud".into(),

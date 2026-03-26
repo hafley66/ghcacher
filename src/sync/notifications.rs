@@ -90,6 +90,40 @@ fn load_existing_gh_ids(conn: &Connection) -> Result<std::collections::HashSet<S
     Ok(set)
 }
 
+/// Converts a GitHub API subject URL to a browser HTML URL and extracts the
+/// subject number (PR number, issue number) if present.
+///
+/// API URL patterns:
+///   .../pulls/123   → .../pull/123  (note: plural → singular)
+///   .../issues/123  → .../issues/123
+///   .../commits/sha → .../commit/sha
+fn parse_subject_url(api_url: &str) -> (Option<String>, Option<i64>) {
+    // Strip API prefix: https://api.github.com/repos/{owner}/{name}/...
+    // to https://github.com/{owner}/{name}/...
+    let path = if let Some(rest) = api_url.strip_prefix("https://api.github.com/repos/") {
+        rest
+    } else {
+        return (None, None);
+    };
+
+    // path is now like: owner/name/pulls/123  or  owner/name/commits/sha
+    let segments: Vec<&str> = path.splitn(4, '/').collect();
+    if segments.len() < 4 {
+        return (None, None);
+    }
+    let (owner, repo, kind, tail) = (segments[0], segments[1], segments[2], segments[3]);
+
+    let (html_kind, number) = match kind {
+        "pulls"   => ("pull",   tail.parse::<i64>().ok()),
+        "issues"  => ("issues", tail.parse::<i64>().ok()),
+        "commits" => ("commit", None),
+        _         => return (None, None),
+    };
+
+    let html_url = format!("https://github.com/{owner}/{repo}/{html_kind}/{tail}");
+    (Some(html_url), number)
+}
+
 fn upsert_notification(
     conn: &Connection,
     thread: &serde_json::Value,
@@ -107,24 +141,34 @@ fn upsert_notification(
     let repo_id = repo_id_map.get(&slug).copied();
     let is_new = !existing_gh_ids.contains(gh_id);
 
+    let subject_url = thread["subject"]["url"].as_str();
+    let (html_url, subject_number) = subject_url
+        .map(parse_subject_url)
+        .unwrap_or((None, None));
+
     let notif_id: i64 = conn.query_row(
         "INSERT INTO notification
-         (gh_id, repo_id, subject_type, subject_title, subject_url, reason, unread, updated_at, last_read_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         (gh_id, repo_id, subject_type, subject_title, subject_url, subject_number, html_url,
+          reason, unread, updated_at, last_read_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          ON CONFLICT(gh_id) DO UPDATE SET
-             subject_title = excluded.subject_title,
-             subject_url   = excluded.subject_url,
-             reason        = excluded.reason,
-             unread        = excluded.unread,
-             updated_at    = excluded.updated_at,
-             last_read_at  = excluded.last_read_at
+             subject_title  = excluded.subject_title,
+             subject_url    = excluded.subject_url,
+             subject_number = excluded.subject_number,
+             html_url       = excluded.html_url,
+             reason         = excluded.reason,
+             unread         = excluded.unread,
+             updated_at     = excluded.updated_at,
+             last_read_at   = excluded.last_read_at
          RETURNING id",
         params![
             gh_id,
             repo_id,
             thread["subject"]["type"].as_str().unwrap_or(""),
             thread["subject"]["title"].as_str().unwrap_or(""),
-            thread["subject"]["url"].as_str(),
+            subject_url,
+            subject_number,
+            html_url,
             thread["reason"].as_str().unwrap_or(""),
             thread["unread"].as_bool().unwrap_or(true) as i64,
             thread["updated_at"].as_str().unwrap_or(""),
@@ -181,6 +225,54 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM notification", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn parse_subject_url_pulls() {
+        let url = "https://api.github.com/repos/myorg/backend/pulls/42";
+        let (html, num) = parse_subject_url(url);
+        assert_eq!(html.as_deref(), Some("https://github.com/myorg/backend/pull/42"));
+        assert_eq!(num, Some(42));
+    }
+
+    #[test]
+    fn parse_subject_url_issues() {
+        let url = "https://api.github.com/repos/myorg/backend/issues/7";
+        let (html, num) = parse_subject_url(url);
+        assert_eq!(html.as_deref(), Some("https://github.com/myorg/backend/issues/7"));
+        assert_eq!(num, Some(7));
+    }
+
+    #[test]
+    fn parse_subject_url_commit() {
+        let url = "https://api.github.com/repos/myorg/backend/commits/abc123";
+        let (html, num) = parse_subject_url(url);
+        assert_eq!(html.as_deref(), Some("https://github.com/myorg/backend/commit/abc123"));
+        assert_eq!(num, None);
+    }
+
+    #[test]
+    fn parse_subject_url_unknown() {
+        let (html, num) = parse_subject_url("https://example.com/other");
+        assert_eq!(html, None);
+        assert_eq!(num, None);
+    }
+
+    #[test]
+    fn upsert_stores_html_url_and_number() {
+        let conn = db::open_in_memory().unwrap();
+        let thread = make_thread("t99", "o", "n", true);
+        do_upsert(&conn, &thread).unwrap();
+
+        let (html_url, subject_number): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT html_url, subject_number FROM notification WHERE gh_id='t99'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(html_url.as_deref(), Some("https://github.com/o/n/pull/1"));
+        assert_eq!(subject_number, Some(1));
     }
 
     #[test]
