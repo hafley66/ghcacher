@@ -1,23 +1,55 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use sqlx::{Column, Row, SqlitePool, TypeInfo, ValueRef};
 use std::io::{self, Write};
 
 use crate::output::Format;
 
-pub fn query_raw(conn: &Connection, sql: &str, format: Format) -> Result<()> {
-    let mut stmt = conn.prepare(sql)?;
-    let col_names: Vec<String> = stmt.column_names().into_iter().map(|s| s.to_owned()).collect();
+pub async fn query_raw(pool: &SqlitePool, sql: &str, format: Format) -> Result<()> {
+    let rows: Vec<sqlx::sqlite::SqliteRow> = sqlx::query(sql)
+        .fetch_all(pool)
+        .await?;
 
-    let rows: Vec<serde_json::Value> = stmt
-        .query_map([], |row| {
+    let col_names: Vec<String> = match rows.first() {
+        Some(row) => row.columns().iter().map(|c| c.name().to_owned()).collect(),
+        None => return Ok(()),
+    };
+
+    let json_rows: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
             let mut map = serde_json::Map::new();
             for (i, col) in col_names.iter().enumerate() {
-                let val: rusqlite::types::Value = row.get(i)?;
-                map.insert(col.clone(), rusqlite_to_json(val));
+                let (is_null, type_name) = {
+                    let raw = row.try_get_raw(i).unwrap();
+                    (raw.is_null(), raw.type_info().name().to_owned())
+                };
+                let val = if is_null {
+                    serde_json::Value::Null
+                } else {
+                    match type_name.as_str() {
+                        "INTEGER" => row
+                            .try_get::<i64, _>(i)
+                            .map(|v| serde_json::Value::Number(v.into()))
+                            .unwrap_or(serde_json::Value::Null),
+                        "REAL" => row
+                            .try_get::<f64, _>(i)
+                            .ok()
+                            .and_then(|f| serde_json::Number::from_f64(f).map(serde_json::Value::Number))
+                            .unwrap_or(serde_json::Value::Null),
+                        "BLOB" => row
+                            .try_get::<Vec<u8>, _>(i)
+                            .map(|b| serde_json::Value::String(format!("<blob {} bytes>", b.len())))
+                            .unwrap_or(serde_json::Value::Null),
+                        _ => row
+                            .try_get::<String, _>(i)
+                            .map(serde_json::Value::String)
+                            .unwrap_or(serde_json::Value::Null),
+                    }
+                };
+                map.insert(col.clone(), val);
             }
-            Ok(serde_json::Value::Object(map))
-        })?
-        .filter_map(|r| r.ok())
+            serde_json::Value::Object(map)
+        })
         .collect();
 
     let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
@@ -26,19 +58,19 @@ pub fn query_raw(conn: &Connection, sql: &str, format: Format) -> Result<()> {
 
     match format {
         Format::Json => {
-            for row in &rows {
+            for row in &json_rows {
                 serde_json::to_writer(&mut out, row)?;
                 writeln!(out)?;
             }
         }
         Format::JsonPretty => {
-            for row in &rows {
+            for row in &json_rows {
                 writeln!(out, "{}", serde_json::to_string_pretty(row)?)?;
             }
         }
         Format::Tsv => {
             writeln!(out, "{}", col_refs.join("\t"))?;
-            for row in &rows {
+            for row in &json_rows {
                 let fields: Vec<String> = col_refs
                     .iter()
                     .map(|col| json_cell(row.get(*col)))
@@ -47,31 +79,15 @@ pub fn query_raw(conn: &Connection, sql: &str, format: Format) -> Result<()> {
             }
         }
         Format::Table => {
-            print_table_raw(&mut out, &rows, &col_refs)?;
+            print_table_raw(&mut out, &json_rows, &col_refs)?;
         }
     }
 
     Ok(())
 }
 
-pub fn query_view(conn: &Connection, view: &str, format: Format) -> Result<()> {
-    query_raw(conn, &format!("SELECT * FROM {view}"), format)
-}
-
-fn rusqlite_to_json(val: rusqlite::types::Value) -> serde_json::Value {
-    match val {
-        rusqlite::types::Value::Null => serde_json::Value::Null,
-        rusqlite::types::Value::Integer(i) => serde_json::Value::Number(i.into()),
-        rusqlite::types::Value::Real(f) => {
-            serde_json::Number::from_f64(f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
-        rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-        rusqlite::types::Value::Blob(b) => {
-            serde_json::Value::String(format!("<blob {} bytes>", b.len()))
-        }
-    }
+pub async fn query_view(pool: &SqlitePool, view: &str, format: Format) -> Result<()> {
+    query_raw(pool, &format!("SELECT * FROM {view}"), format).await
 }
 
 fn json_cell(v: Option<&serde_json::Value>) -> String {
@@ -91,7 +107,6 @@ fn print_table_raw(out: &mut impl Write, rows: &[serde_json::Value], columns: &[
         }
     }
 
-    // Header
     let header: Vec<String> = columns.iter().zip(&widths).map(|(c, w)| format!("{:<w$}", c, w = w)).collect();
     writeln!(out, "{}", header.join("  "))?;
     let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
@@ -114,23 +129,10 @@ mod tests {
     use super::*;
     use crate::db;
 
-    #[test]
-    fn query_raw_empty_result() {
-        let conn = db::open_in_memory().unwrap();
-        // Should not panic on empty result
-        query_raw(&conn, "SELECT * FROM repo WHERE 1=0", Format::Json).unwrap();
-    }
-
-    #[test]
-    fn rusqlite_to_json_variants() {
-        use rusqlite::types::Value;
-        assert_eq!(rusqlite_to_json(Value::Null), serde_json::Value::Null);
-        assert_eq!(rusqlite_to_json(Value::Integer(42)), serde_json::json!(42));
-        assert_eq!(rusqlite_to_json(Value::Text("hi".into())), serde_json::json!("hi"));
-        match rusqlite_to_json(Value::Blob(vec![1, 2, 3])) {
-            serde_json::Value::String(s) => assert!(s.contains("blob")),
-            _ => panic!("expected string"),
-        }
+    #[tokio::test]
+    async fn query_raw_empty_result() {
+        let pool = db::open_in_memory().await.unwrap();
+        query_raw(&pool, "SELECT * FROM repo WHERE 1=0", Format::Json).await.unwrap();
     }
 
     #[test]
@@ -141,11 +143,12 @@ mod tests {
         assert_eq!(json_cell(Some(&serde_json::json!(99))), "99");
     }
 
-    #[test]
-    fn query_raw_returns_rows() {
-        let conn = db::open_in_memory().unwrap();
-        db::upsert_repo(&conn, "o", "n", "main").unwrap();
-        // Just ensure it runs without error; output goes to stdout
-        query_raw(&conn, "SELECT owner, name FROM repo", Format::Json).unwrap();
+    #[tokio::test]
+    async fn query_raw_returns_rows() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        db::upsert_repo(&mut *conn, "o", "n", "main").await.unwrap();
+        drop(conn);
+        query_raw(&pool, "SELECT owner, name FROM repo", Format::Json).await.unwrap();
     }
 }

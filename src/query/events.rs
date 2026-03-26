@@ -1,10 +1,10 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 
 use crate::output::Format;
 use super::sql;
 
-pub fn query(conn: &Connection, repo: Option<&str>, event_type: Option<&str>, format: Format) -> Result<()> {
+pub async fn query(pool: &SqlitePool, repo: Option<&str>, event_type: Option<&str>, format: Format) -> Result<()> {
     let mut conditions = vec!["1=1".to_owned()];
 
     if let Some(slug) = repo {
@@ -33,5 +33,5 @@ pub fn query(conn: &Connection, repo: Option<&str>, event_type: Option<&str>, fo
          LIMIT 100"
     );
 
-    sql::query_raw(conn, &query, format)
+    sql::query_raw(pool, &query, format).await
 }

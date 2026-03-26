@@ -142,7 +142,7 @@ cmd::resume(7748)?;
 | `PullRequest` | `id`, `repo_slug`, `number`, `title`, `author`, `head_ref`, `base_ref`, `state`, `draft`, `mergeable`, `additions`, `deletions`, `changed_files`, `created_at`, `updated_at`, `merged_at`, `body` |
 | `Review` | `id`, `pr_id`, `author`, `state` (`APPROVED` \| `CHANGES_REQUESTED` \| `COMMENTED`), `body`, `submitted_at` |
 | `Comment` | `id`, `pr_id`, `author`, `body`, `path`, `line`, `created_at` |
-| `Notification` | `id`, `gh_id`, `repo_slug`, `subject_type`, `subject_title`, `subject_url`, `reason`, `unread`, `updated_at` |
+| `Notification` | `id`, `gh_id`, `repo_slug`, `subject_type`, `subject_title`, `subject_url`, `subject_number` (PR/issue number), `html_url` (browser URL), `reason`, `unread`, `updated_at` |
 | `Branch` | `id`, `repo_slug`, `name`, `sha`, `behind_default`, `ahead_default`, `updated_at` |
 | `RepoEvent` | `id`, `repo_slug`, `gh_id`, `event_type`, `actor`, `payload` (JSON), `created_at` |
 | `RateLimit` | `api_type` (`rest` \| `graphql`), `remaining`, `reset_at`, `gql_cost` |

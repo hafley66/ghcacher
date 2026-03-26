@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use serde::Serialize;
+use sqlx::SqliteConnection;
 use std::collections::HashMap;
-use std::process::Command;
 use std::time::Instant;
+use tokio::process::Command;
 
 use crate::db;
 
@@ -32,37 +34,32 @@ struct GraphqlCallLine<'a> {
     duration_ms: u64,
 }
 
-pub trait GitHubClient {
-    fn call(&self, conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse>;
-    fn graphql(&self, conn: &rusqlite::Connection, endpoint: &str, query: &str) -> Result<serde_json::Value>;
-    fn throttle_if_needed(&self, conn: &rusqlite::Connection, api_type: &str) -> Result<i64>;
+#[async_trait]
+pub trait GitHubClient: Send + Sync {
+    async fn call(&self, conn: &mut SqliteConnection, req: &GhRequest<'_>) -> Result<GhResponse>;
+    async fn graphql(&self, conn: &mut SqliteConnection, endpoint: &str, query: &str) -> Result<serde_json::Value>;
+    async fn throttle_if_needed(&self, conn: &mut SqliteConnection, api_type: &str) -> Result<i64>;
 }
 
 pub struct GhClient {
-    pub binary: String,
+    pub binary:              String,
     pub rate_warn_threshold: i64,
     pub rate_stop_threshold: i64,
-    pub silent: bool,
-    pub calls_to_stdout: bool,
+    pub silent:              bool,
+    pub calls_to_stdout:     bool,
 }
 
 pub struct GhRequest<'a> {
     pub endpoint: &'a str,
-    pub method: &'a str,
-    pub headers: Vec<(&'a str, &'a str)>,
-    pub body: Option<&'a str>,
+    pub method:   &'a str,
+    pub headers:  Vec<(&'a str, &'a str)>,
+    pub body:     Option<&'a str>,
     pub paginate: bool,
 }
 
 impl<'a> GhRequest<'a> {
     pub fn get(endpoint: &'a str) -> Self {
-        GhRequest {
-            endpoint,
-            method: "GET",
-            headers: vec![],
-            body: None,
-            paginate: false,
-        }
+        GhRequest { endpoint, method: "GET", headers: vec![], body: None, paginate: false }
     }
 
     pub fn with_etag(mut self, etag: &'a str) -> Self {
@@ -82,17 +79,15 @@ impl<'a> GhRequest<'a> {
 }
 
 pub struct GhResponse {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
-    pub body: serde_json::Value,
+    pub status:      u16,
+    pub headers:     HashMap<String, String>,
+    pub body:        serde_json::Value,
     #[allow(dead_code)]
     pub duration_ms: u64,
 }
 
 impl GhResponse {
-    pub fn is_not_modified(&self) -> bool {
-        self.status == 304
-    }
+    pub fn is_not_modified(&self) -> bool { self.status == 304 }
 
     pub fn etag(&self) -> Option<&str> {
         self.headers.get("etag").map(|s| s.as_str())
@@ -103,26 +98,26 @@ impl GhResponse {
     }
 
     pub fn poll_interval(&self) -> Option<i64> {
-        self.headers
-            .get("x-poll-interval")
-            .and_then(|v| v.parse().ok())
+        self.headers.get("x-poll-interval").and_then(|v| v.parse().ok())
     }
 
     pub fn rate_remaining(&self) -> Option<i64> {
-        self.headers
-            .get("x-ratelimit-remaining")
-            .and_then(|v| v.parse().ok())
+        self.headers.get("x-ratelimit-remaining").and_then(|v| v.parse().ok())
     }
 
     pub fn rate_reset(&self) -> Option<i64> {
-        self.headers
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.parse().ok())
+        self.headers.get("x-ratelimit-reset").and_then(|v| v.parse().ok())
     }
 }
 
 impl GhClient {
-    pub fn new(binary: impl Into<String>, warn_threshold: i64, stop_threshold: i64, silent: bool, calls_to_stdout: bool) -> Self {
+    pub fn new(
+        binary: impl Into<String>,
+        warn_threshold: i64,
+        stop_threshold: i64,
+        silent: bool,
+        calls_to_stdout: bool,
+    ) -> Self {
         GhClient {
             binary: binary.into(),
             rate_warn_threshold: warn_threshold,
@@ -132,56 +127,51 @@ impl GhClient {
         }
     }
 
-    fn emit_rate_log(&self, conn: &rusqlite::Connection) {
+    async fn emit_rate_log(&self, conn: &mut SqliteConnection) {
         if self.silent { return; }
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         println!("{}", serde_json::to_string(&RateSummary {
             ts,
-            rest_remaining: latest_remaining(conn, "rest"),
-            graphql_remaining: latest_remaining(conn, "graphql"),
+            rest_remaining:    latest_remaining(conn, "rest").await,
+            graphql_remaining: latest_remaining(conn, "graphql").await,
         }).unwrap_or_default());
     }
 }
 
+#[async_trait]
 impl GitHubClient for GhClient {
-    fn throttle_if_needed(&self, conn: &rusqlite::Connection, api_type: &str) -> Result<i64> {
+    async fn throttle_if_needed(&self, conn: &mut SqliteConnection, api_type: &str) -> Result<i64> {
         let warn = self.rate_warn_threshold;
         let stop = self.rate_stop_threshold;
 
-        let row: Option<(i64, i64)> = {
-            let mut stmt = conn.prepare_cached(
-                "SELECT rate_remaining, COALESCE(rate_reset, 0)
-                 FROM call_log WHERE api_type = ?1 AND rate_remaining IS NOT NULL
-                 ORDER BY id DESC LIMIT 1",
-            )?;
-            let mut rows = stmt.query(rusqlite::params![api_type])?;
-            rows.next()?.map(|r| (r.get_unwrap(0), r.get_unwrap(1)))
-        };
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT rate_remaining, COALESCE(rate_reset, 0)
+             FROM call_log WHERE api_type = ? AND rate_remaining IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(api_type)
+        .fetch_optional(conn)
+        .await?;
 
         let (remaining, reset_ts) = match row {
-            None => return Ok(i64::MAX), // no data yet, proceed
+            None => return Ok(i64::MAX),
             Some(r) => r,
         };
 
         if remaining <= stop {
-            let now = chrono::Utc::now().timestamp();
+            let now  = chrono::Utc::now().timestamp();
             let wait = (reset_ts - now).max(1);
-            tracing::warn!(
-                api_type,
-                remaining,
-                wait_seconds = wait,
-                "rate limit critical -- sleeping until reset"
-            );
-            std::thread::sleep(std::time::Duration::from_secs(wait as u64));
+            tracing::warn!(api_type, remaining, wait_seconds = wait, "rate limit critical -- sleeping until reset");
+            tokio::time::sleep(std::time::Duration::from_secs(wait as u64)).await;
         } else if remaining <= warn {
             tracing::warn!(api_type, remaining, "rate limit low -- sleeping 10s");
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
 
         Ok(remaining)
     }
 
-    fn call(&self, conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse> {
+    async fn call(&self, conn: &mut SqliteConnection, req: &GhRequest<'_>) -> Result<GhResponse> {
         let mut cmd = Command::new(&self.binary);
         cmd.arg("api").arg("--include");
 
@@ -194,24 +184,21 @@ impl GitHubClient for GhClient {
         for (k, v) in &req.headers {
             cmd.arg("-H").arg(format!("{}: {}", k, v));
         }
-        if let Some(body) = req.body {
-            cmd.arg("--input").arg("-");
-            cmd.stdin(std::process::Stdio::piped());
-            let _ = body; // body passed via stdin below
-        }
 
         cmd.arg(req.endpoint);
 
         let t = Instant::now();
 
-        let output = if req.body.is_some() {
+        let output = if let Some(body) = req.body {
+            use tokio::io::AsyncWriteExt;
             let mut child = cmd.stdin(std::process::Stdio::piped()).spawn()
                 .context("spawning gh")?;
-            use std::io::Write;
-            child.stdin.as_mut().unwrap().write_all(req.body.unwrap().as_bytes())?;
-            child.wait_with_output().context("waiting on gh")?
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(body.as_bytes()).await?;
+            drop(stdin);
+            child.wait_with_output().await.context("waiting on gh")?
         } else {
-            cmd.output().context("spawning gh")?
+            cmd.output().await.context("spawning gh")?
         };
 
         let duration_ms = t.elapsed().as_millis() as u64;
@@ -222,7 +209,6 @@ impl GitHubClient for GhClient {
         let body: serde_json::Value = if body_str.trim().is_empty() || status == 304 {
             serde_json::Value::Null
         } else if req.paginate {
-            // --paginate concatenates JSON arrays; wrap them
             parse_paginated_body(body_str)?
         } else {
             serde_json::from_str(body_str)
@@ -231,22 +217,21 @@ impl GitHubClient for GhClient {
 
         let resp = GhResponse { status, headers, body, duration_ms };
 
-        db::log_call(
-            conn,
-            &db::CallLogEntry {
-                endpoint: req.endpoint,
-                api_type: "rest",
-                method: req.method,
-                status_code: Some(status),
-                etag: resp.etag(),
-                last_modified: resp.last_modified(),
-                rate_remaining: resp.rate_remaining(),
-                rate_reset: resp.rate_reset(),
-                gql_cost: None,
-                cache_hit: resp.is_not_modified(),
-                duration_ms: Some(duration_ms as i64),
-            },
-        )?;
+        db::log_call(conn, &db::CallLogEntry {
+            endpoint:       req.endpoint,
+            api_type:       "rest",
+            method:         req.method,
+            status_code:    Some(status),
+            etag:           resp.etag(),
+            last_modified:  resp.last_modified(),
+            rate_remaining: resp.rate_remaining(),
+            rate_reset:     resp.rate_reset(),
+            gql_cost:       None,
+            cache_hit:      resp.is_not_modified(),
+            duration_ms:    Some(duration_ms as i64),
+        })
+        .await?;
+
         if self.calls_to_stdout {
             let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             println!("{}", serde_json::to_string(&RestCallLine {
@@ -257,7 +242,7 @@ impl GitHubClient for GhClient {
                 duration_ms,
             }).unwrap_or_default());
         }
-        self.emit_rate_log(conn);
+        self.emit_rate_log(conn).await;
 
         db::set_poll_state(
             conn,
@@ -266,15 +251,13 @@ impl GitHubClient for GhClient {
             resp.last_modified(),
             resp.poll_interval(),
             !resp.is_not_modified(),
-        )?;
+        )
+        .await?;
 
         Ok(resp)
     }
 
-    /// Run a GraphQL query. Automatically injects `rateLimit { cost remaining resetAt }`
-    /// so we can track the separate GraphQL point pool in call_log.
-    /// `endpoint` is used as the call_log label (e.g. "graphql:prs:full/owner/name").
-    fn graphql(&self, conn: &rusqlite::Connection, endpoint: &str, query: &str) -> Result<serde_json::Value> {
+    async fn graphql(&self, conn: &mut SqliteConnection, endpoint: &str, query: &str) -> Result<serde_json::Value> {
         let instrumented = inject_rate_limit(query);
 
         let mut cmd = Command::new(&self.binary);
@@ -282,7 +265,7 @@ impl GitHubClient for GhClient {
             .arg("-f").arg(format!("query={}", instrumented));
 
         let t = Instant::now();
-        let output = cmd.output().context("spawning gh for graphql")?;
+        let output = cmd.output().await.context("spawning gh for graphql")?;
         let duration_ms = t.elapsed().as_millis() as u64;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -299,30 +282,26 @@ impl GitHubClient for GhClient {
             bail!("GraphQL errors: {}", errors);
         }
 
-        // Pull rate limit info from the response body (separate GraphQL point pool).
-        let gql_cost     = body["data"]["rateLimit"]["cost"].as_i64();
+        let gql_cost      = body["data"]["rateLimit"]["cost"].as_i64();
         let gql_remaining = body["data"]["rateLimit"]["remaining"].as_i64();
-        // resetAt is an ISO timestamp; also available via header
         let header_remaining = headers.get("x-ratelimit-remaining").and_then(|v| v.parse().ok());
         let header_reset     = headers.get("x-ratelimit-reset").and_then(|v| v.parse().ok());
 
-        db::log_call(
-            conn,
-            &db::CallLogEntry {
-                endpoint,
-                api_type: "graphql",
-                method: "POST",
-                status_code: Some(status),
-                etag: None,
-                last_modified: None,
-                // Prefer body-level remaining (GraphQL pool) over header (may reflect REST pool)
-                rate_remaining: gql_remaining.or(header_remaining),
-                rate_reset: header_reset,
-                gql_cost,
-                cache_hit: false,
-                duration_ms: Some(duration_ms as i64),
-            },
-        )?;
+        db::log_call(conn, &db::CallLogEntry {
+            endpoint,
+            api_type:       "graphql",
+            method:         "POST",
+            status_code:    Some(status),
+            etag:           None,
+            last_modified:  None,
+            rate_remaining: gql_remaining.or(header_remaining),
+            rate_reset:     header_reset,
+            gql_cost,
+            cache_hit:      false,
+            duration_ms:    Some(duration_ms as i64),
+        })
+        .await?;
+
         if self.calls_to_stdout {
             let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             println!("{}", serde_json::to_string(&GraphqlCallLine {
@@ -334,23 +313,26 @@ impl GitHubClient for GhClient {
                 duration_ms,
             }).unwrap_or_default());
         }
-        self.emit_rate_log(conn);
+        self.emit_rate_log(conn).await;
 
         Ok(body["data"].clone())
     }
 }
 
-fn latest_remaining(conn: &rusqlite::Connection, api_type: &str) -> Option<i64> {
-    conn.query_row(
-        "SELECT rate_remaining FROM call_log WHERE api_type = ?1 AND rate_remaining IS NOT NULL ORDER BY id DESC LIMIT 1",
-        rusqlite::params![api_type],
-        |r| r.get(0),
-    ).ok()
+async fn latest_remaining(conn: &mut SqliteConnection, api_type: &str) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT rate_remaining FROM call_log
+         WHERE api_type = ? AND rate_remaining IS NOT NULL
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(api_type)
+    .fetch_optional(conn)
+    .await
+    .ok()
+    .flatten()
 }
 
-/// Parse the `--include` output: HTTP status line + headers, blank line, body.
 fn parse_response(raw: &str) -> Result<(u16, HashMap<String, String>, &str)> {
-    // Find the last HTTP/... block (paginate appends multiple responses)
     let last_http = raw.rfind("\nHTTP/").map(|i| i + 1).unwrap_or(0);
     let relevant = &raw[last_http..];
 
@@ -382,12 +364,10 @@ fn parse_response(raw: &str) -> Result<(u16, HashMap<String, String>, &str)> {
     Ok((status, headers, body))
 }
 
-/// Inject `rateLimit { cost remaining resetAt }` into a GraphQL query so we
-/// can track the separate GraphQL point pool. Looks for the last `}` and inserts before it.
 fn inject_rate_limit(query: &str) -> String {
     let trimmed = query.trim_end();
     if trimmed.contains("rateLimit") {
-        return query.to_owned(); // caller already added it
+        return query.to_owned();
     }
     if let Some(pos) = trimmed.rfind('}') {
         let mut out = trimmed.to_owned();
@@ -398,10 +378,8 @@ fn inject_rate_limit(query: &str) -> String {
     }
 }
 
-/// `gh api --paginate` streams multiple JSON arrays; concatenate into one.
 fn parse_paginated_body(body: &str) -> Result<serde_json::Value> {
     let mut combined: Vec<serde_json::Value> = vec![];
-    // Pages are separated by newlines; each is a JSON array
     for chunk in body.split('\n') {
         let chunk = chunk.trim();
         if chunk.is_empty() { continue; }
@@ -414,67 +392,63 @@ fn parse_paginated_body(body: &str) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Array(combined))
 }
 
-/// Test double for GhClient. Records all calls and returns queued responses.
+/// Test double. Records all calls and returns queued responses.
 #[cfg(test)]
 pub(crate) struct MockGhClient {
-    pub graphql_calls: std::cell::RefCell<Vec<(String, String)>>,
-    pub rest_calls: std::cell::RefCell<Vec<String>>,
-    graphql_queue: std::cell::RefCell<std::collections::VecDeque<serde_json::Value>>,
-    rest_queue: std::cell::RefCell<std::collections::VecDeque<(u16, serde_json::Value)>>,
+    pub graphql_calls: std::sync::Mutex<Vec<(String, String)>>,
+    pub rest_calls:    std::sync::Mutex<Vec<String>>,
+    graphql_queue:     std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    rest_queue:        std::sync::Mutex<std::collections::VecDeque<(u16, serde_json::Value)>>,
 }
 
 #[cfg(test)]
 impl MockGhClient {
     pub fn new() -> Self {
         MockGhClient {
-            graphql_calls: std::cell::RefCell::new(vec![]),
-            rest_calls: std::cell::RefCell::new(vec![]),
-            graphql_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
-            rest_queue: std::cell::RefCell::new(std::collections::VecDeque::new()),
+            graphql_calls: std::sync::Mutex::new(vec![]),
+            rest_calls:    std::sync::Mutex::new(vec![]),
+            graphql_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            rest_queue:    std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
     pub fn push_graphql(&self, v: serde_json::Value) {
-        self.graphql_queue.borrow_mut().push_back(v);
+        self.graphql_queue.lock().unwrap().push_back(v);
     }
 
     pub fn push_rest(&self, v: serde_json::Value) {
-        self.rest_queue.borrow_mut().push_back((200, v));
+        self.rest_queue.lock().unwrap().push_back((200, v));
     }
 
     pub fn push_rest_304(&self) {
-        self.rest_queue.borrow_mut().push_back((304, serde_json::Value::Null));
+        self.rest_queue.lock().unwrap().push_back((304, serde_json::Value::Null));
     }
 
     pub fn graphql_call_count(&self) -> usize {
-        self.graphql_calls.borrow().len()
+        self.graphql_calls.lock().unwrap().len()
     }
 
     pub fn rest_call_count(&self) -> usize {
-        self.rest_calls.borrow().len()
+        self.rest_calls.lock().unwrap().len()
     }
 }
 
 #[cfg(test)]
+#[async_trait]
 impl GitHubClient for MockGhClient {
-    fn call(&self, _conn: &rusqlite::Connection, req: &GhRequest) -> Result<GhResponse> {
-        self.rest_calls.borrow_mut().push(req.endpoint.to_owned());
-        let (status, body) = self.rest_queue.borrow_mut().pop_front()
+    async fn call(&self, _conn: &mut SqliteConnection, req: &GhRequest<'_>) -> Result<GhResponse> {
+        self.rest_calls.lock().unwrap().push(req.endpoint.to_owned());
+        let (status, body) = self.rest_queue.lock().unwrap().pop_front()
             .unwrap_or((200, serde_json::json!([])));
-        Ok(GhResponse {
-            status,
-            headers: HashMap::new(),
-            body,
-            duration_ms: 0,
-        })
+        Ok(GhResponse { status, headers: HashMap::new(), body, duration_ms: 0 })
     }
 
-    fn graphql(&self, _conn: &rusqlite::Connection, endpoint: &str, query: &str) -> Result<serde_json::Value> {
-        self.graphql_calls.borrow_mut().push((endpoint.to_owned(), query.to_owned()));
-        Ok(self.graphql_queue.borrow_mut().pop_front().unwrap_or(serde_json::json!({})))
+    async fn graphql(&self, _conn: &mut SqliteConnection, endpoint: &str, query: &str) -> Result<serde_json::Value> {
+        self.graphql_calls.lock().unwrap().push((endpoint.to_owned(), query.to_owned()));
+        Ok(self.graphql_queue.lock().unwrap().pop_front().unwrap_or(serde_json::json!({})))
     }
 
-    fn throttle_if_needed(&self, _conn: &rusqlite::Connection, _api_type: &str) -> Result<i64> {
+    async fn throttle_if_needed(&self, _conn: &mut SqliteConnection, _api_type: &str) -> Result<i64> {
         Ok(i64::MAX)
     }
 }
@@ -563,7 +537,6 @@ mod tests {
     fn inject_rate_limit_idempotent() {
         let q = "{ rateLimit { cost remaining resetAt } repository { name } }";
         let out = inject_rate_limit(q);
-        // Should not double-inject
         assert_eq!(out.matches("rateLimit").count(), 1);
     }
 
@@ -574,56 +547,60 @@ mod tests {
         assert_eq!(out, q);
     }
 
-    #[test]
-    fn throttle_no_data_returns_max() {
-        let conn = crate::db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn throttle_no_data_returns_max() {
+        let pool = crate::db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
         let client = GhClient::new("gh", 500, 50, false, false);
-        let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
+        let remaining = client.throttle_if_needed(&mut *c, "rest").await.unwrap();
         assert_eq!(remaining, i64::MAX);
     }
 
-    #[test]
-    fn throttle_healthy_rate_limit_no_sleep() {
-        let conn = crate::db::open_in_memory().unwrap();
-        // Log a call with plenty of remaining
-        crate::db::log_call(&conn, &crate::db::CallLogEntry {
-            endpoint: "/repos/o/n/events",
-            api_type: "rest",
-            method: "GET",
-            status_code: Some(200),
-            etag: None,
-            last_modified: None,
+    #[tokio::test]
+    async fn throttle_healthy_rate_limit_no_sleep() {
+        let pool = crate::db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        crate::db::log_call(&mut *c, &crate::db::CallLogEntry {
+            endpoint:       "/repos/o/n/events",
+            api_type:       "rest",
+            method:         "GET",
+            status_code:    Some(200),
+            etag:           None,
+            last_modified:  None,
             rate_remaining: Some(4800),
-            rate_reset: Some(chrono::Utc::now().timestamp() + 3600),
-            gql_cost: None,
-            cache_hit: false,
-            duration_ms: Some(50),
-        }).unwrap();
+            rate_reset:     Some(chrono::Utc::now().timestamp() + 3600),
+            gql_cost:       None,
+            cache_hit:      false,
+            duration_ms:    Some(50),
+        })
+        .await
+        .unwrap();
         let client = GhClient::new("gh", 500, 50, false, false);
-        // Should return immediately (4800 > 500 warn threshold)
-        let remaining = client.throttle_if_needed(&conn, "rest").unwrap();
+        let remaining = client.throttle_if_needed(&mut *c, "rest").await.unwrap();
         assert_eq!(remaining, 4800);
     }
 
-    #[test]
-    fn throttle_reads_correct_api_type() {
-        let conn = crate::db::open_in_memory().unwrap();
-        // REST pool healthy, GraphQL pool empty -- throttle("graphql") returns MAX
-        crate::db::log_call(&conn, &crate::db::CallLogEntry {
-            endpoint: "/repos/o/n/events",
-            api_type: "rest",
-            method: "GET",
-            status_code: Some(200),
-            etag: None,
-            last_modified: None,
+    #[tokio::test]
+    async fn throttle_reads_correct_api_type() {
+        let pool = crate::db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        crate::db::log_call(&mut *c, &crate::db::CallLogEntry {
+            endpoint:       "/repos/o/n/events",
+            api_type:       "rest",
+            method:         "GET",
+            status_code:    Some(200),
+            etag:           None,
+            last_modified:  None,
             rate_remaining: Some(100),
-            rate_reset: Some(chrono::Utc::now().timestamp() + 3600),
-            gql_cost: None,
-            cache_hit: false,
-            duration_ms: Some(50),
-        }).unwrap();
+            rate_reset:     Some(chrono::Utc::now().timestamp() + 3600),
+            gql_cost:       None,
+            cache_hit:      false,
+            duration_ms:    Some(50),
+        })
+        .await
+        .unwrap();
         let client = GhClient::new("gh", 500, 50, false, false);
-        let remaining = client.throttle_if_needed(&conn, "graphql").unwrap();
-        assert_eq!(remaining, i64::MAX); // no graphql calls yet
+        let remaining = client.throttle_if_needed(&mut *c, "graphql").await.unwrap();
+        assert_eq!(remaining, i64::MAX);
     }
 }

@@ -1,14 +1,13 @@
 use anyhow::Result;
-use rusqlite::Connection;
 use serde::Deserialize;
+use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 
 pub const DEFAULT_PORT: u16 = 7748;
 pub const DEFAULT_TTL_SECS: u64 = 30;
@@ -84,7 +83,7 @@ impl Subscriptions {
         }
     }
 
-    fn sweep(&self) {
+    pub fn sweep(&self) {
         let ttl = self.ttl;
         self.inner
             .write()
@@ -122,28 +121,30 @@ impl Subscriptions {
 // ── SSE client list ───────────────────────────────────────────────────────────
 
 struct SseClient {
-    stream: TcpStream,
+    writer: tokio::net::tcp::OwnedWriteHalf,
     last_sent_id: i64,
 }
 
-type Clients = Arc<Mutex<Vec<SseClient>>>;
+type Clients = Arc<tokio::sync::Mutex<Vec<SseClient>>>;
 
-/// Fetch change_log rows with id > min_id. Returns (id, json_string) pairs.
-fn fetch_changes(conn: &Connection, min_id: i64) -> Result<Vec<(i64, String)>> {
-    let mut stmt = conn.prepare_cached(
+async fn fetch_changes(pool: &SqlitePool, min_id: i64) -> Result<Vec<(i64, String)>> {
+    let rows = sqlx::query(
         "SELECT id, entity_type, entity_id, event, repo_slug, payload_json, occurred_at
-         FROM change_log WHERE id > ?1 ORDER BY id",
-    )?;
-    let mut rows = stmt.query(rusqlite::params![min_id])?;
+         FROM change_log WHERE id > ? ORDER BY id",
+    )
+    .bind(min_id)
+    .fetch_all(pool)
+    .await?;
+
     let mut out = vec![];
-    while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        let entity_type: String = row.get(1)?;
-        let entity_id: i64 = row.get(2)?;
-        let event: String = row.get(3)?;
-        let repo_slug: Option<String> = row.get(4)?;
-        let payload_json: Option<String> = row.get(5)?;
-        let occurred_at: String = row.get(6)?;
+    for row in &rows {
+        let id: i64 = row.get(0);
+        let entity_type: String = row.get(1);
+        let entity_id: i64 = row.get(2);
+        let event: String = row.get(3);
+        let repo_slug: Option<String> = row.get(4);
+        let payload_json: Option<String> = row.get(5);
+        let occurred_at: String = row.get(6);
 
         let payload: serde_json::Value = payload_json
             .as_deref()
@@ -164,29 +165,17 @@ fn fetch_changes(conn: &Connection, min_id: i64) -> Result<Vec<(i64, String)>> {
     Ok(out)
 }
 
-fn broadcast_loop(clients: Clients, db_path: PathBuf) {
-    let conn = match Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "SSE broadcast: failed to open DB");
-            return;
-        }
-    };
-    let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
-
+async fn broadcast_loop(clients: Clients, pool: SqlitePool) {
     loop {
-        std::thread::sleep(Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let mut guard = clients.lock().unwrap();
+        let mut guard = clients.lock().await;
         if guard.is_empty() {
             continue;
         }
 
         let min_id = guard.iter().map(|c| c.last_sent_id).min().unwrap_or(0);
-        let rows = match fetch_changes(&conn, min_id) {
+        let rows = match fetch_changes(&pool, min_id).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "SSE broadcast: DB poll failed");
@@ -197,63 +186,67 @@ fn broadcast_loop(clients: Clients, db_path: PathBuf) {
             continue;
         }
 
-        guard.retain_mut(|client| {
+        let mut keep = Vec::new();
+        for mut client in guard.drain(..) {
             let threshold = client.last_sent_id;
+            let mut ok = true;
             for (id, json) in rows.iter().filter(|(id, _)| *id > threshold) {
                 let frame = format!("id: {id}\ndata: {json}\n\n");
-                if client.stream.write_all(frame.as_bytes()).is_err() {
-                    return false;
+                if client.writer.write_all(frame.as_bytes()).await.is_err() {
+                    ok = false;
+                    break;
                 }
                 client.last_sent_id = *id;
             }
-            true
-        });
+            if ok {
+                keep.push(client);
+            }
+        }
+        *guard = keep;
     }
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
-pub fn run(
+pub async fn run(
     subs: Arc<Subscriptions>,
     staging: PathBuf,
-    db_path: PathBuf,
+    pool: SqlitePool,
     port: u16,
     paused: Arc<AtomicBool>,
 ) -> Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
         .map_err(|e| anyhow::anyhow!("cmd HTTP bind 127.0.0.1:{port}: {e}"))?;
     tracing::info!(port, "cmd+SSE server listening on 127.0.0.1");
 
-    let clients: Clients = Arc::new(Mutex::new(vec![]));
+    let clients: Clients = Arc::new(tokio::sync::Mutex::new(vec![]));
 
-    // Broadcast loop thread
+    // Broadcast loop
     let clients_bcast = Arc::clone(&clients);
-    std::thread::spawn(move || broadcast_loop(clients_bcast, db_path));
+    tokio::spawn(async move { broadcast_loop(clients_bcast, pool).await });
 
-    // Sweep thread
+    // Sweep loop
     let subs_sweep = Arc::clone(&subs);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(10));
-        subs_sweep.sweep();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            subs_sweep.sweep();
+        }
     });
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let subs = Arc::clone(&subs);
-                let clients = Arc::clone(&clients);
-                let staging = staging.clone();
-                let paused = Arc::clone(&paused);
-                std::thread::spawn(move || {
-                    if let Err(e) = handle(s, &subs, &staging, clients, paused) {
-                        tracing::warn!(error = %e, "cmd: request failed");
-                    }
-                });
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let subs = Arc::clone(&subs);
+        let clients = Arc::clone(&clients);
+        let staging = staging.clone();
+        let paused = Arc::clone(&paused);
+        tokio::spawn(async move {
+            if let Err(e) = handle(stream, &subs, &staging, clients, paused).await {
+                tracing::warn!(error = %e, "cmd: request failed");
             }
-            Err(e) => tracing::warn!(error = %e, "cmd: accept error"),
-        }
+        });
     }
-    Ok(())
 }
 
 struct RequestHead {
@@ -263,9 +256,9 @@ struct RequestHead {
     last_event_id: i64,
 }
 
-fn parse_head(reader: &mut BufReader<&TcpStream>) -> Result<Option<RequestHead>> {
+async fn parse_head(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> Result<Option<RequestHead>> {
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    reader.read_line(&mut request_line).await?;
     let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
     if parts.len() < 2 {
         return Ok(None);
@@ -277,7 +270,7 @@ fn parse_head(reader: &mut BufReader<&TcpStream>) -> Result<Option<RequestHead>>
     let mut last_event_id: i64 = 0;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line)?;
+        reader.read_line(&mut line).await?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             break;
@@ -293,84 +286,92 @@ fn parse_head(reader: &mut BufReader<&TcpStream>) -> Result<Option<RequestHead>>
     Ok(Some(RequestHead { method, path, content_length, last_event_id }))
 }
 
-fn handle(mut stream: TcpStream, subs: &Subscriptions, staging: &Path, clients: Clients, paused: Arc<AtomicBool>) -> Result<()> {
-    let mut reader = BufReader::new(&stream);
-    let head = match parse_head(&mut reader)? {
+async fn handle(
+    stream: tokio::net::TcpStream,
+    subs: &Subscriptions,
+    staging: &Path,
+    clients: Clients,
+    paused: Arc<AtomicBool>,
+) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut buf_reader = BufReader::new(reader);
+    let head = match parse_head(&mut buf_reader).await? {
         Some(h) => h,
         None => return Ok(()),
     };
 
     let mut body = vec![0u8; head.content_length];
     if head.content_length > 0 {
-        reader.read_exact(&mut body)?;
+        buf_reader.read_exact(&mut body).await?;
     }
 
     match (head.method.as_str(), head.path.as_str()) {
         ("GET", "/events") => {
-            stream.write_all(
+            writer.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
-            )?;
-            clients.lock().unwrap().push(SseClient {
-                stream,
+            ).await?;
+            clients.lock().await.push(SseClient {
+                writer,
                 last_sent_id: head.last_event_id,
             });
-            // Connection is now owned by the broadcast loop; don't close it.
             Ok(())
         }
         ("POST", "/subscribe") => {
             let req: SubscribeReq = serde_json::from_slice(&body)?;
-            let repo_path = ensure_repo(staging, &req.owner, &req.repo)?;
+            let repo_path = ensure_repo(staging, &req.owner, &req.repo).await?;
             subs.upsert(req.uuid, req.owner, req.repo, req.pr_sync, req.notifications);
-            respond_200(&mut stream, &serde_json::json!({"path": repo_path}).to_string())
+            respond_200(&mut writer, &serde_json::json!({"path": repo_path}).to_string()).await
         }
         ("POST", "/heartbeat") => {
             let req: HeartbeatReq = serde_json::from_slice(&body)?;
             let ok = subs.heartbeat(&req.uuid);
-            respond_200(&mut stream, &serde_json::json!({"ok": ok}).to_string())
+            respond_200(&mut writer, &serde_json::json!({"ok": ok}).to_string()).await
         }
         ("POST", "/pause") => {
             paused.store(true, Ordering::Relaxed);
-            respond_200(&mut stream, r#"{"ok":true}"#)
+            respond_200(&mut writer, r#"{"ok":true}"#).await
         }
         ("POST", "/resume") => {
             paused.store(false, Ordering::Relaxed);
-            respond_200(&mut stream, r#"{"ok":true}"#)
+            respond_200(&mut writer, r#"{"ok":true}"#).await
         }
         _ => {
-            stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
+            writer.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await?;
             Ok(())
         }
     }
 }
 
-fn respond_200(stream: &mut TcpStream, body: &str) -> Result<()> {
+async fn respond_200(writer: &mut tokio::net::tcp::OwnedWriteHalf, body: &str) -> Result<()> {
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
-    stream.write_all(resp.as_bytes())?;
+    writer.write_all(resp.as_bytes()).await?;
     Ok(())
 }
 
 /// Clone repo to `{staging}/{owner}/{repo}` if absent, then `git fetch --all`.
-fn ensure_repo(staging: &Path, owner: &str, repo: &str) -> Result<PathBuf> {
+async fn ensure_repo(staging: &Path, owner: &str, repo: &str) -> Result<PathBuf> {
     let dest = staging.join(owner).join(repo);
     if !dest.exists() {
-        std::fs::create_dir_all(dest.parent().unwrap())?;
+        tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
         let slug = format!("{owner}/{repo}");
-        let status = Command::new("gh")
+        let status = tokio::process::Command::new("gh")
             .args(["repo", "clone", &slug, &dest.to_string_lossy()])
             .status()
+            .await
             .map_err(|e| anyhow::anyhow!("gh repo clone: {e}"))?;
         if !status.success() {
             anyhow::bail!("gh repo clone {slug} failed");
         }
         tracing::info!(%slug, path = %dest.display(), "cloned");
     } else {
-        let status = Command::new("git")
+        let status = tokio::process::Command::new("git")
             .args(["-C", &dest.to_string_lossy(), "fetch", "--all"])
             .status()
+            .await
             .map_err(|e| anyhow::anyhow!("git fetch: {e}"))?;
         if !status.success() {
             anyhow::bail!("git fetch --all failed in {}", dest.display());

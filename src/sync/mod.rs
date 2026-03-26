@@ -4,7 +4,7 @@ pub mod notifications;
 pub mod prs;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -14,8 +14,8 @@ use crate::db;
 use crate::gh::{GhRequest, GitHubClient};
 
 pub struct SyncFilter {
-    pub repo: Option<String>,
-    pub prs_only: bool,
+    pub repo:        Option<String>,
+    pub prs_only:    bool,
     pub notifs_only: bool,
     pub events_only: bool,
 }
@@ -38,53 +38,40 @@ impl SyncFilter {
     }
 }
 
-/// Sentinel stored in poll_state.etag when we've confirmed owner is a user, not an org.
 const NOT_ORG: &str = "__user__";
 
-/// Discover all repo names under a GitHub org or user account.
-/// Tries /orgs/{owner}/repos first; falls back to /users/{owner}/repos on 404.
-/// The 404 result is memoized in poll_state so the org probe only fires once.
-/// ETag-gated and paginated -- typically a free 304 after the first call.
-fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> Result<Vec<String>> {
-    let org_endpoint = format!("/orgs/{owner}/repos");
+async fn discover_org_repos(
+    conn: &mut sqlx::SqliteConnection,
+    gh: &dyn GitHubClient,
+    owner: &str,
+) -> Result<Vec<String>> {
+    let org_endpoint  = format!("/orgs/{owner}/repos");
     let user_endpoint = format!("/users/{owner}/repos");
 
-    let poll = db::get_poll_state(conn, &org_endpoint)?;
+    let poll = db::get_poll_state(conn, &org_endpoint).await?;
 
     let body = if poll.etag.as_deref() == Some(NOT_ORG) {
-        // Already confirmed this owner is a user account; skip the org probe.
-        let poll2 = db::get_poll_state(conn, &user_endpoint)?;
+        let poll2 = db::get_poll_state(conn, &user_endpoint).await?;
         let mut req2 = GhRequest::get(&user_endpoint).paginated();
-        if let Some(ref etag) = poll2.etag {
-            req2 = req2.with_etag(etag);
-        }
-        let resp2 = gh.call(conn, &req2)?;
-        if resp2.is_not_modified() {
-            return repos_from_db(conn, owner);
-        }
+        if let Some(ref etag) = poll2.etag { req2 = req2.with_etag(etag); }
+        let resp2 = gh.call(conn, &req2).await?;
+        if resp2.is_not_modified() { return repos_from_db(conn, owner).await; }
         resp2.body
     } else {
         let mut req = GhRequest::get(&org_endpoint).paginated();
-        if let Some(ref etag) = poll.etag {
-            req = req.with_etag(etag);
-        }
-        let resp = gh.call(conn, &req)?;
+        if let Some(ref etag) = poll.etag { req = req.with_etag(etag); }
+        let resp = gh.call(conn, &req).await?;
 
         if resp.status == 404 {
-            // Not an org account; memoize so we skip this probe on future polls.
-            db::set_poll_state(conn, &org_endpoint, Some(NOT_ORG), None, None, false)?;
-            let poll2 = db::get_poll_state(conn, &user_endpoint)?;
+            db::set_poll_state(conn, &org_endpoint, Some(NOT_ORG), None, None, false).await?;
+            let poll2 = db::get_poll_state(conn, &user_endpoint).await?;
             let mut req2 = GhRequest::get(&user_endpoint).paginated();
-            if let Some(ref etag) = poll2.etag {
-                req2 = req2.with_etag(etag);
-            }
-            let resp2 = gh.call(conn, &req2)?;
-            if resp2.is_not_modified() {
-                return repos_from_db(conn, owner);
-            }
+            if let Some(ref etag) = poll2.etag { req2 = req2.with_etag(etag); }
+            let resp2 = gh.call(conn, &req2).await?;
+            if resp2.is_not_modified() { return repos_from_db(conn, owner).await; }
             resp2.body
         } else if resp.is_not_modified() {
-            return repos_from_db(conn, owner);
+            return repos_from_db(conn, owner).await;
         } else {
             resp.body
         }
@@ -92,24 +79,18 @@ fn discover_org_repos(conn: &Connection, gh: &dyn GitHubClient, owner: &str) -> 
 
     let names: Vec<String> = body
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| r["name"].as_str().map(str::to_owned))
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|r| r["name"].as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
 
     tracing::info!(owner, count = names.len() as u64, "discovered org repos");
     Ok(names)
 }
 
-/// Return repo names already stored in the DB for this owner.
-/// Used when the repo-list endpoint returns 304 (list unchanged).
-fn repos_from_db(conn: &Connection, owner: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare_cached("SELECT name FROM repo WHERE owner = ?1 ORDER BY name")?;
-    let names: Vec<String> = stmt
-        .query_map(rusqlite::params![owner], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+async fn repos_from_db(conn: &mut sqlx::SqliteConnection, owner: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM repo WHERE owner = ? ORDER BY name")
+        .bind(owner)
+        .fetch_all(conn)
+        .await?;
     Ok(names)
 }
 
@@ -118,24 +99,21 @@ fn org_to_repos(org: &OrgConfig, names: Vec<String>) -> Vec<RepoConfig> {
         .into_iter()
         .filter(|n| !org.exclude.contains(n))
         .map(|name| RepoConfig {
-            owner: org.owner.clone(),
+            owner:                org.owner.clone(),
             name,
-            default_branch: None,
-            sync_prs: org.sync_prs,
-            sync_notifications: org.sync_notifications,
-            sync_events: org.sync_events,
-            sync_branches: org.sync_branches.clone(),
-            checkout_on_sync: org.checkout_on_sync,
+            default_branch:       None,
+            sync_prs:             org.sync_prs,
+            sync_notifications:   org.sync_notifications,
+            sync_events:          org.sync_events,
+            sync_branches:        org.sync_branches.clone(),
+            checkout_on_sync:     org.checkout_on_sync,
             poll_interval_seconds: org.poll_interval_seconds,
         })
         .collect()
 }
 
-/// `full_sweep` forces a full GraphQL fetch of all open PRs instead of
-/// using event hints to target only changed PRs. Always true for one-shot
-/// `ghcache sync`; true only on the first iteration of `ghcache watch`.
-pub fn run(
-    conn: &Connection,
+pub async fn run(
+    pool: &SqlitePool,
     gh: &dyn GitHubClient,
     cfg: &ResolvedConfig,
     filter: SyncFilter,
@@ -143,26 +121,27 @@ pub fn run(
     extra_repos: &[RepoConfig],
     extra_notif_slugs: &[(String, String)],
 ) -> Result<()> {
-    // Expand [[org]] entries into synthetic RepoConfigs.
     let mut org_repos: Vec<RepoConfig> = vec![];
     let mut org_owners: HashSet<String> = HashSet::new();
-    for org in &cfg.orgs {
-        match discover_org_repos(conn, gh, &org.owner) {
-            Ok(names) => {
-                org_owners.insert(org.owner.clone());
-                org_repos.extend(org_to_repos(org, names));
+    {
+        let mut conn = pool.acquire().await?;
+        for org in &cfg.orgs {
+            match discover_org_repos(&mut *conn, gh, &org.owner).await {
+                Ok(names) => {
+                    org_owners.insert(org.owner.clone());
+                    org_repos.extend(org_to_repos(org, names));
+                }
+                Err(e) => tracing::error!(owner = %org.owner, error = %e, "org repo discovery failed"),
             }
-            Err(e) => tracing::error!(owner = %org.owner, error = %e, "org repo discovery failed"),
         }
     }
 
-    // Sync events once per org (one API call instead of one per repo).
-    // Returns repo_name -> dirty PR numbers; used below to drive targeted syncs.
     let mut org_dirty: HashMap<(String, String), Vec<i64>> = HashMap::new();
     if filter.do_events() {
+        let mut conn = pool.acquire().await?;
         for org in &cfg.orgs {
             if org.sync_events.unwrap_or(false) {
-                match events::sync_org(conn, gh, &org.owner) {
+                match events::sync_org(&mut *conn, gh, &org.owner).await {
                     Ok(dirty) => {
                         for (name, prs) in dirty {
                             org_dirty.insert((org.owner.clone(), name), prs);
@@ -174,29 +153,31 @@ pub fn run(
         }
     }
 
-    let all_repos: Vec<&RepoConfig> = cfg.repos.iter().chain(org_repos.iter()).chain(extra_repos.iter()).collect();
+    let all_repos: Vec<&RepoConfig> = cfg.repos.iter()
+        .chain(org_repos.iter())
+        .chain(extra_repos.iter())
+        .collect();
 
     for repo in all_repos {
         if let Some(ref slug) = filter.repo {
-            if &repo.slug() != slug {
-                continue;
-            }
+            if &repo.slug() != slug { continue; }
         }
 
         tracing::info!(repo = %repo.slug(), full_sweep, "syncing");
 
-        gh.throttle_if_needed(conn, "rest")?;
+        // Throttle outside the per-repo transaction.
+        {
+            let mut c = pool.acquire().await?;
+            gh.throttle_if_needed(&mut *c, "rest").await?;
+        }
 
-        let tx = conn.unchecked_transaction()?;
-
+        let mut tx = pool.begin().await?;
         let mut dirty_prs: Vec<i64> = vec![];
 
-        let result = (|| -> Result<()> {
+        let result: Result<()> = async {
             let default_branch = repo.default_branch.as_deref().unwrap_or("main");
-            let repo_id = db::upsert_repo(conn, &repo.owner, &repo.name, default_branch)?;
+            let repo_id = db::upsert_repo(&mut *tx, &repo.owner, &repo.name, default_branch).await?;
 
-            // Events: use the pre-fetched org batch for org repos; fall back to
-            // per-repo call for [[repo]] entries and subscription extras.
             if filter.do_events() && repo.sync_events.unwrap_or(false) {
                 if org_owners.contains(&repo.owner) {
                     dirty_prs = org_dirty
@@ -204,49 +185,56 @@ pub fn run(
                         .cloned()
                         .unwrap_or_default();
                 } else {
-                    dirty_prs = events::sync(conn, gh, repo_id, &repo.owner, &repo.name)?;
+                    dirty_prs = events::sync(&mut *tx, gh, repo_id, &repo.owner, &repo.name).await?;
                 }
             }
 
             if filter.do_prs() && repo.sync_prs.unwrap_or(false) {
                 if full_sweep || filter.prs_only {
-                    prs::sync(conn, gh, repo_id, &repo.owner, &repo.name)?;
+                    prs::sync(&mut *tx, gh, repo_id, &repo.owner, &repo.name).await?;
                 } else {
-                    prs::sync_targeted(conn, gh, repo_id, &repo.owner, &repo.name, &dirty_prs)?;
+                    prs::sync_targeted(&mut *tx, gh, repo_id, &repo.owner, &repo.name, &dirty_prs).await?;
                 }
             }
 
-            if repo.sync_branches.as_ref().map(|b| !b.is_empty()).unwrap_or(false) {
-                if filter.all() {
-                    branches::sync(conn, gh, repo_id, &repo.owner, &repo.name, repo.sync_branches.as_deref().unwrap_or(&[]))?;
-                }
+            if repo.sync_branches.as_ref().map(|b| !b.is_empty()).unwrap_or(false) && filter.all() {
+                branches::sync(
+                    &mut *tx,
+                    gh,
+                    repo_id,
+                    &repo.owner,
+                    &repo.name,
+                    repo.sync_branches.as_deref().unwrap_or(&[]),
+                )
+                .await?;
             }
 
             Ok(())
-        })();
+        }
+        .await;
 
         if let Err(e) = result {
             tracing::error!(repo = %repo.slug(), error = %e, "sync failed, rolling back");
-            tx.rollback()?;
+            let _ = tx.rollback().await;
         } else {
-            tx.commit()?;
+            tx.commit().await?;
         }
     }
 
-    // Notifications are cross-repo, sync once.
     let notifs_needed = filter.do_notifs()
         && (cfg.sync_notifications
             || cfg.repos.iter().any(|r| r.sync_notifications.unwrap_or(false))
             || !extra_notif_slugs.is_empty());
     if notifs_needed {
-        notifications::sync(conn, gh, cfg, extra_notif_slugs)?;
+        let mut conn = pool.acquire().await?;
+        notifications::sync(&mut *conn, gh, cfg, extra_notif_slugs).await?;
     }
 
     Ok(())
 }
 
-pub fn watch(
-    conn: &Connection,
+pub async fn watch(
+    pool: &SqlitePool,
     gh: &dyn GitHubClient,
     cfg: &ResolvedConfig,
     subs: Option<std::sync::Arc<crate::cmd::Subscriptions>>,
@@ -257,22 +245,18 @@ pub fn watch(
     loop {
         if paused.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::debug!("sync paused");
-            std::thread::sleep(Duration::from_millis(500));
+            tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
 
         let filter = SyncFilter {
-            repo: None,
-            prs_only: false,
-            notifs_only: false,
-            events_only: false,
+            repo: None, prs_only: false, notifs_only: false, events_only: false,
         };
 
-        // Repos subscribed via the cmd server that aren't already in config.
         let (extra_repos, extra_notif_slugs): (Vec<RepoConfig>, Vec<(String, String)>) = subs
             .as_ref()
             .map(|s| {
-                let pr_repos = s.active_pr_sync_repos();
+                let pr_repos    = s.active_pr_sync_repos();
                 let notif_repos = s.active_notifications_repos();
 
                 let extra_repos = pr_repos
@@ -281,12 +265,12 @@ pub fn watch(
                     .map(|(owner, name)| RepoConfig {
                         owner,
                         name,
-                        default_branch: None,
-                        sync_prs: Some(true),
-                        sync_notifications: None,
-                        sync_events: None,
-                        sync_branches: None,
-                        checkout_on_sync: None,
+                        default_branch:        None,
+                        sync_prs:              Some(true),
+                        sync_notifications:    None,
+                        sync_events:           None,
+                        sync_branches:         None,
+                        checkout_on_sync:      None,
                         poll_interval_seconds: None,
                     })
                     .collect();
@@ -304,45 +288,44 @@ pub fn watch(
             tracing::debug!(count = extra_repos.len(), "syncing subscription repos");
         }
 
-        if let Err(e) = run(conn, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs) {
+        if let Err(e) = run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs).await {
             tracing::error!(error = %e, "watch sync error");
         }
         first_run = false;
 
+        // Checkout tasks.
         {
-            let staging = &cfg.staging_folder;
-            let mut tasks: Vec<checkout::CheckoutTask> = cfg.repos.iter()
-                .filter(|r| r.checkout_on_sync.unwrap_or(false))
-                .flat_map(|r| {
-                    let repo_id = match db::get_repo_id(conn, &r.owner, &r.name) {
-                        Ok(Some(id)) => id,
-                        _ => return vec![],
-                    };
-                    r.sync_branches.as_deref().unwrap_or(&[]).iter().map(|b| checkout::CheckoutTask {
+            let mut conn = pool.acquire().await?;
+            let mut tasks: Vec<checkout::CheckoutTask> = vec![];
+            for r in cfg.repos.iter().filter(|r| r.checkout_on_sync.unwrap_or(false)) {
+                let repo_id = match db::get_repo_id(&mut *conn, &r.owner, &r.name).await {
+                    Ok(Some(id)) => id,
+                    _ => continue,
+                };
+                for b in r.sync_branches.as_deref().unwrap_or(&[]) {
+                    tasks.push(checkout::CheckoutTask {
                         repo_id,
-                        owner: r.owner.clone(),
-                        name: r.name.clone(),
+                        owner:  r.owner.clone(),
+                        name:   r.name.clone(),
                         branch: b.clone(),
-                    }).collect()
-                })
-                .collect();
+                    });
+                }
+            }
 
-            // Org repos were upserted into the DB during sync; query by owner.
             for org in cfg.orgs.iter().filter(|o| o.checkout_on_sync.unwrap_or(false)) {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT id, name FROM repo WHERE owner = ?1"
-                ).unwrap();
-                let rows: Vec<(i64, String)> = stmt
-                    .query_map(rusqlite::params![org.owner], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let rows: Vec<(i64, String)> = sqlx::query_as(
+                    "SELECT id, name FROM repo WHERE owner = ?",
+                )
+                .bind(&org.owner)
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap_or_default();
                 for (repo_id, name) in rows {
                     for branch in org.sync_branches.as_deref().unwrap_or(&[]) {
                         tasks.push(checkout::CheckoutTask {
                             repo_id,
-                            owner: org.owner.clone(),
-                            name: name.clone(),
+                            owner:  org.owner.clone(),
+                            name:   name.clone(),
                             branch: branch.clone(),
                         });
                     }
@@ -350,7 +333,7 @@ pub fn watch(
             }
 
             if !tasks.is_empty() {
-                if let Err(e) = checkout::checkout_all(conn, staging, &tasks) {
+                if let Err(e) = checkout::checkout_all(pool, &cfg.staging_folder, &tasks).await {
                     tracing::error!(error = %e, "checkout_all failed");
                 }
             }
@@ -358,7 +341,7 @@ pub fn watch(
 
         let interval = cfg.poll_interval_seconds;
         tracing::debug!(sleep_seconds = interval, "watch sleeping");
-        std::thread::sleep(Duration::from_secs(interval));
+        tokio::time::sleep(Duration::from_secs(interval)).await;
     }
 }
 
@@ -371,25 +354,25 @@ mod tests {
 
     fn cfg_with_repo(owner: &str, name: &str) -> ResolvedConfig {
         ResolvedConfig {
-            db_path: std::path::PathBuf::from(":memory:"),
-            staging_folder: std::path::PathBuf::from("/tmp"),
+            db_path:               std::path::PathBuf::from(":memory:"),
+            staging_folder:        std::path::PathBuf::from("/tmp"),
             poll_interval_seconds: 60,
-            log_level: "info".into(),
-            gh_binary: "gh".into(),
-            rate_warn_threshold: 500,
-            rate_stop_threshold: 50,
-            cmd_port: 7748,
+            log_level:             "info".into(),
+            gh_binary:             "gh".into(),
+            rate_warn_threshold:   500,
+            rate_stop_threshold:   50,
+            cmd_port:              7748,
             heartbeat_ttl_seconds: 30,
-            sync_notifications: false,
+            sync_notifications:    false,
             repos: vec![RepoConfig {
-                owner: owner.into(),
-                name: name.into(),
-                default_branch: Some("main".into()),
-                sync_prs: Some(true),
-                sync_events: Some(true),
-                sync_notifications: Some(false),
-                sync_branches: None,
-                checkout_on_sync: None,
+                owner:                owner.into(),
+                name:                 name.into(),
+                default_branch:       Some("main".into()),
+                sync_prs:             Some(true),
+                sync_events:          Some(true),
+                sync_notifications:   Some(false),
+                sync_branches:        None,
+                checkout_on_sync:     None,
                 poll_interval_seconds: None,
             }],
             orgs: vec![],
@@ -400,38 +383,34 @@ mod tests {
         SyncFilter { repo: None, prs_only: false, notifs_only: false, events_only: false }
     }
 
-    /// Full sweep: graphql called once with the full PR list endpoint.
-    #[test]
-    fn full_sweep_calls_graphql_once() {
-        let conn = db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn full_sweep_calls_graphql_once() {
+        let pool = db::open_in_memory().await.unwrap();
         let mock = MockGhClient::new();
-        // events returns 200 empty array; graphql returns empty PR nodes
         mock.push_rest(serde_json::json!([]));
         mock.push_graphql(serde_json::json!({"repository": {"pullRequests": {"nodes": []}}}));
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), true, &[], &[]).unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), true, &[], &[]).await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 1);
-        let (endpoint, _) = &mock.graphql_calls.borrow()[0];
+        let (endpoint, _) = &mock.graphql_calls.lock().unwrap()[0];
         assert!(endpoint.contains("full"), "expected full endpoint, got {endpoint}");
     }
 
-    /// No new events (304) → zero graphql calls on targeted path.
-    #[test]
-    fn targeted_no_events_skips_graphql() {
-        let conn = db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn targeted_no_events_skips_graphql() {
+        let pool = db::open_in_memory().await.unwrap();
         let mock = MockGhClient::new();
-        mock.push_rest_304(); // events 304
+        mock.push_rest_304();
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 0);
     }
 
-    /// Two PR events → exactly one batched graphql call labeled "targeted".
-    #[test]
-    fn targeted_batches_multiple_prs_in_one_call() {
-        let conn = db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn targeted_batches_multiple_prs_in_one_call() {
+        let pool = db::open_in_memory().await.unwrap();
         let mock = MockGhClient::new();
         mock.push_rest(serde_json::json!([
             {"id": "1", "type": "PullRequestEvent", "actor": {"login": "alice"},
@@ -440,29 +419,27 @@ mod tests {
              "payload": {"action": "submitted", "pull_request": {"number": 17}},
              "created_at": "2026-01-01T00:00:01Z"},
         ]));
-        // targeted graphql call returns empty repo (no PRs to upsert)
         mock.push_graphql(serde_json::json!({"repository": {}}));
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 1, "expected exactly 1 batched graphql call");
-        let (endpoint, query) = &mock.graphql_calls.borrow()[0];
+        let (endpoint, query) = &mock.graphql_calls.lock().unwrap()[0];
         assert!(endpoint.contains("targeted"), "expected targeted endpoint, got {endpoint}");
         assert!(query.contains("pr_42"), "expected alias pr_42 in query");
         assert!(query.contains("pr_17"), "expected alias pr_17 in query");
     }
 
-    /// Non-PR events don't trigger any graphql call.
-    #[test]
-    fn push_events_do_not_trigger_pr_sync() {
-        let conn = db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn push_events_do_not_trigger_pr_sync() {
+        let pool = db::open_in_memory().await.unwrap();
         let mock = MockGhClient::new();
         mock.push_rest(serde_json::json!([
             {"id": "9", "type": "PushEvent", "actor": {"login": "alice"},
              "payload": {"ref": "refs/heads/main"}, "created_at": "2026-01-01T00:00:00Z"},
         ]));
 
-        run(&conn, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 0);
     }
@@ -477,25 +454,25 @@ mod integration {
 
     fn live_cfg(tmp: &std::path::Path) -> ResolvedConfig {
         ResolvedConfig {
-            db_path: tmp.join("test.db"),
-            staging_folder: tmp.to_path_buf(),
+            db_path:               tmp.join("test.db"),
+            staging_folder:        tmp.to_path_buf(),
             poll_interval_seconds: 60,
-            log_level: "warn".into(),
-            gh_binary: "gh".into(),
-            rate_warn_threshold: 500,
-            rate_stop_threshold: 50,
-            cmd_port: 7748,
+            log_level:             "warn".into(),
+            gh_binary:             "gh".into(),
+            rate_warn_threshold:   500,
+            rate_stop_threshold:   50,
+            cmd_port:              7748,
             heartbeat_ttl_seconds: 30,
-            sync_notifications: false,
+            sync_notifications:    false,
             repos: vec![RepoConfig {
-                owner: "hafley66".into(),
-                name: "cc-hud".into(),
-                default_branch: Some("main".into()),
-                sync_prs: Some(true),
-                sync_events: Some(true),
-                sync_notifications: Some(false),
-                sync_branches: Some(vec!["main".into()]),
-                checkout_on_sync: None,
+                owner:                "hafley66".into(),
+                name:                 "cc-hud".into(),
+                default_branch:       Some("main".into()),
+                sync_prs:             Some(true),
+                sync_events:          Some(true),
+                sync_notifications:   Some(false),
+                sync_branches:        Some(vec!["main".into()]),
+                checkout_on_sync:     None,
                 poll_interval_seconds: None,
             }],
             orgs: vec![],
@@ -506,69 +483,66 @@ mod integration {
         SyncFilter { repo: None, prs_only: false, notifs_only: false, events_only: false }
     }
 
-    /// Full sync against real hafley66/cc-hud, then a second pass to confirm 304 cache hits.
-    /// Run with: cargo test integration -- --include-ignored
-    #[test]
+    #[tokio::test]
     #[ignore = "requires gh CLI authenticated"]
-    fn live_sync_and_cache_hit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = live_cfg(tmp.path());
-        let conn = db::open(&cfg.db_path).unwrap();
-        let gh = GhClient::new("gh", 500, 50, true, false); // silent=true: no stdout noise in test
+    async fn live_sync_and_cache_hit() {
+        let tmp  = tempfile::tempdir().unwrap();
+        let cfg  = live_cfg(tmp.path());
+        let pool = db::open(&cfg.db_path).await.unwrap();
+        let gh   = GhClient::new("gh", 500, 50, true, false);
 
-        // --- first pass: full sweep ---
-        run(&conn, &gh, &cfg, all_filter(), true, &[], &[]).unwrap();
+        run(&pool, &gh, &cfg, all_filter(), true, &[], &[]).await.unwrap();
 
-        let repo_count: i64 = conn.query_row(
+        let repo_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM repo WHERE owner='hafley66' AND name='cc-hud'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(repo_count, 1, "repo not inserted");
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repo_count, 1);
 
-        let branch_count: i64 = conn.query_row(
+        let branch_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM branch b
              JOIN repo r ON r.id = b.repo_id
              WHERE r.owner='hafley66' AND r.name='cc-hud'",
-            [], |r| r.get(0),
-        ).unwrap();
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert!(branch_count >= 1, "no branches synced; got {branch_count}");
 
-        let main_sha: String = conn.query_row(
+        let main_sha: String = sqlx::query_scalar(
             "SELECT b.sha FROM branch b
              JOIN repo r ON r.id = b.repo_id
              WHERE r.owner='hafley66' AND r.name='cc-hud' AND b.name='main'",
-            [], |r| r.get(0),
-        ).expect("main branch not in DB");
-        assert!(!main_sha.is_empty(), "main branch sha is empty");
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("main branch not in DB");
+        assert!(!main_sha.is_empty());
 
-        let rest_calls: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM call_log WHERE api_type='rest'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert!(rest_calls > 0, "no REST calls logged");
+        let rest_calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_log WHERE api_type='rest'")
+            .fetch_one(&pool).await.unwrap();
+        assert!(rest_calls > 0);
 
-        let change_rows: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM change_log",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert!(change_rows > 0, "change_log empty after first sync");
+        let change_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM change_log")
+            .fetch_one(&pool).await.unwrap();
+        assert!(change_rows > 0);
 
-        // --- second pass: should be all 304s ---
-        run(&conn, &gh, &cfg, all_filter(), false, &[], &[]).unwrap();
+        run(&pool, &gh, &cfg, all_filter(), false, &[], &[]).await.unwrap();
 
-        let cache_hits: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM call_log WHERE cache_hit=1",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert!(cache_hits > 0, "second sync had no cache hits (expected 304s)");
+        let cache_hits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_log WHERE cache_hit=1")
+            .fetch_one(&pool).await.unwrap();
+        assert!(cache_hits > 0);
 
-        // sha is stable across passes
-        let main_sha2: String = conn.query_row(
+        let main_sha2: String = sqlx::query_scalar(
             "SELECT b.sha FROM branch b
              JOIN repo r ON r.id = b.repo_id
              WHERE r.owner='hafley66' AND r.name='cc-hud' AND b.name='main'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(main_sha, main_sha2, "main branch sha changed between syncs unexpectedly");
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(main_sha, main_sha2);
     }
 }

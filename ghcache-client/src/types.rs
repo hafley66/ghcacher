@@ -50,6 +50,8 @@ pub struct Notification {
     pub subject_type: String,
     pub subject_title: String,
     pub subject_url: Option<String>,
+    pub subject_number: Option<i64>,
+    pub html_url: Option<String>,
     pub reason: String,
     pub unread: bool,
     pub updated_at: String,

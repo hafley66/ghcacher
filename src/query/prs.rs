@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rusqlite::Connection;
 use serde::Serialize;
+use sqlx::{Row, SqlitePool};
 
 use crate::output::{self, Format};
 
@@ -23,8 +23,8 @@ pub struct PrRow {
     pub updated_at: String,
 }
 
-pub fn query(
-    conn: &Connection,
+pub async fn query(
+    pool: &SqlitePool,
     repo: Option<&str>,
     state: &str,
     needs_review: bool,
@@ -52,7 +52,11 @@ pub fn query(
     }
 
     if mine {
-        match std::process::Command::new("gh").args(["api", "user", "--jq", ".login"]).output() {
+        match tokio::process::Command::new("gh")
+            .args(["api", "user", "--jq", ".login"])
+            .output()
+            .await
+        {
             Ok(out) if out.status.success() => {
                 let login = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !login.is_empty() {
@@ -80,28 +84,27 @@ pub fn query(
          ORDER BY pr.updated_at DESC"
     );
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<PrRow> = stmt
-        .query_map([], |r| {
-            Ok(PrRow {
-                repo_slug: r.get(0)?,
-                number: r.get(1)?,
-                title: r.get(2)?,
-                author: r.get(3)?,
-                head_ref: r.get(4)?,
-                state: r.get(5)?,
-                draft: r.get::<_, i64>(6)? != 0,
-                mergeable: r.get(7)?,
-                additions: r.get(8)?,
-                deletions: r.get(9)?,
-                created_at: r.get(10)?,
-                updated_at: r.get(11)?,
-                approvals: r.get(12)?,
-                changes_requested: r.get(13)?,
-                comment_count: r.get(14)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
+    let rows: Vec<PrRow> = sqlx::query(&sql)
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|r| PrRow {
+            repo_slug: r.get(0),
+            number: r.get(1),
+            title: r.get(2),
+            author: r.get(3),
+            head_ref: r.get(4),
+            state: r.get(5),
+            draft: r.get::<i64, _>(6) != 0,
+            mergeable: r.get(7),
+            additions: r.get(8),
+            deletions: r.get(9),
+            created_at: r.get(10),
+            updated_at: r.get(11),
+            approvals: r.get(12),
+            changes_requested: r.get(13),
+            comment_count: r.get(14),
+        })
         .collect();
 
     output::print_rows(
@@ -147,88 +150,88 @@ pub struct CommentRow {
     pub created_at: String,
 }
 
-pub fn query_one(conn: &Connection, number: u32, repo: &str, format: Format) -> Result<()> {
+pub async fn query_one(pool: &SqlitePool, number: u32, repo: &str, format: Format) -> Result<()> {
     let parts: Vec<&str> = repo.splitn(2, '/').collect();
     anyhow::ensure!(parts.len() == 2, "repo must be owner/name format");
     let (owner, name) = (parts[0], parts[1]);
 
-    let pr_id: Option<i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT pr.id FROM pull_request pr
-             JOIN repo r ON r.id = pr.repo_id
-             WHERE r.owner = ?1 AND r.name = ?2 AND pr.number = ?3",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![owner, name, number])?;
-        rows.next()?.map(|r| r.get_unwrap(0))
-    };
+    let pr_id: Option<i64> = sqlx::query_scalar(
+        "SELECT pr.id FROM pull_request pr
+         JOIN repo r ON r.id = pr.repo_id
+         WHERE r.owner = ? AND r.name = ? AND pr.number = ?",
+    )
+    .bind(owner)
+    .bind(name)
+    .bind(number as i64)
+    .fetch_optional(pool)
+    .await?;
 
     let pr_id = anyhow::Context::context(pr_id, format!("PR #{number} not found in {repo}"))?;
 
-    let detail: PrDetail = {
-        let mut stmt = conn.prepare(
-            "SELECT r.owner || '/' || r.name, pr.number, pr.title, pr.author, pr.state,
-                    pr.draft, pr.mergeable, pr.additions, pr.deletions,
-                    pr.created_at, pr.updated_at, pr.body
-             FROM pull_request pr JOIN repo r ON r.id = pr.repo_id
-             WHERE pr.id = ?1",
-        )?;
-        stmt.query_row(rusqlite::params![pr_id], |r| {
-            Ok(PrDetail {
-                repo_slug: r.get(0)?,
-                number: r.get(1)?,
-                title: r.get(2)?,
-                author: r.get(3)?,
-                state: r.get(4)?,
-                draft: r.get::<_, i64>(5)? != 0,
-                mergeable: r.get(6)?,
-                additions: r.get(7)?,
-                deletions: r.get(8)?,
-                created_at: r.get(9)?,
-                updated_at: r.get(10)?,
-                body: r.get(11)?,
-                reviews: vec![],
-                comments: vec![],
-                labels: vec![],
-            })
-        })?
+    let row = sqlx::query(
+        "SELECT r.owner || '/' || r.name, pr.number, pr.title, pr.author, pr.state,
+                pr.draft, pr.mergeable, pr.additions, pr.deletions,
+                pr.created_at, pr.updated_at, pr.body
+         FROM pull_request pr JOIN repo r ON r.id = pr.repo_id
+         WHERE pr.id = ?",
+    )
+    .bind(pr_id)
+    .fetch_one(pool)
+    .await?;
+
+    let detail = PrDetail {
+        repo_slug: row.get(0),
+        number: row.get(1),
+        title: row.get(2),
+        author: row.get(3),
+        state: row.get(4),
+        draft: row.get::<i64, _>(5) != 0,
+        mergeable: row.get(6),
+        additions: row.get(7),
+        deletions: row.get(8),
+        created_at: row.get(9),
+        updated_at: row.get(10),
+        body: row.get(11),
+        reviews: vec![],
+        comments: vec![],
+        labels: vec![],
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT author, state, body, submitted_at FROM pr_review WHERE pr_id = ?1 ORDER BY submitted_at",
-    )?;
-    let reviews: Vec<ReviewRow> = stmt
-        .query_map(rusqlite::params![pr_id], |r| {
-            Ok(ReviewRow {
-                author: r.get(0)?,
-                state: r.get(1)?,
-                body: r.get(2)?,
-                submitted_at: r.get(3)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let reviews: Vec<ReviewRow> = sqlx::query(
+        "SELECT author, state, body, submitted_at FROM pr_review WHERE pr_id = ? ORDER BY submitted_at",
+    )
+    .bind(pr_id)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| ReviewRow {
+        author: r.get(0),
+        state: r.get(1),
+        body: r.get(2),
+        submitted_at: r.get(3),
+    })
+    .collect();
 
-    let mut stmt = conn.prepare(
-        "SELECT author, body, path, line, created_at FROM pr_comment WHERE pr_id = ?1 ORDER BY created_at",
-    )?;
-    let comments: Vec<CommentRow> = stmt
-        .query_map(rusqlite::params![pr_id], |r| {
-            Ok(CommentRow {
-                author: r.get(0)?,
-                body: r.get(1)?,
-                path: r.get(2)?,
-                line: r.get(3)?,
-                created_at: r.get(4)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let comments: Vec<CommentRow> = sqlx::query(
+        "SELECT author, body, path, line, created_at FROM pr_comment WHERE pr_id = ? ORDER BY created_at",
+    )
+    .bind(pr_id)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| CommentRow {
+        author: r.get(0),
+        body: r.get(1),
+        path: r.get(2),
+        line: r.get(3),
+        created_at: r.get(4),
+    })
+    .collect();
 
-    let mut stmt = conn.prepare("SELECT label FROM pr_label WHERE pr_id = ?1 ORDER BY label")?;
-    let labels: Vec<String> = stmt
-        .query_map(rusqlite::params![pr_id], |r| r.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let labels: Vec<String> = sqlx::query_scalar("SELECT label FROM pr_label WHERE pr_id = ? ORDER BY label")
+        .bind(pr_id)
+        .fetch_all(pool)
+        .await?;
 
     let full = PrDetail { reviews, comments, labels, ..detail };
     output::print_rows(&[full], format, &["repo_slug", "number", "title", "state", "author"])
@@ -266,39 +269,43 @@ mod tests {
         })
     }
 
-    #[test]
-    fn query_open_prs() {
-        let conn = db::open_in_memory().unwrap();
-        let repo_id = db::upsert_repo(&conn, "o", "n", "main").unwrap();
-        upsert_pr_for_test(&conn, repo_id, &make_pr(1)).unwrap();
-        upsert_pr_for_test(&conn, repo_id, &make_pr(2)).unwrap();
+    #[tokio::test]
+    async fn query_open_prs() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *conn, "o", "n", "main").await.unwrap();
+        upsert_pr_for_test(&mut *conn, repo_id, &make_pr(1)).await.unwrap();
+        upsert_pr_for_test(&mut *conn, repo_id, &make_pr(2)).await.unwrap();
+        drop(conn);
 
-        let sql = "SELECT COUNT(*) FROM pull_request WHERE state='open'";
-        let count: i64 = conn.query_row(sql, [], |r| r.get(0)).unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pull_request WHERE state='open'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(count, 2);
     }
 
-    #[test]
-    fn query_needs_review_filter() {
-        let conn = db::open_in_memory().unwrap();
-        let repo_id = db::upsert_repo(&conn, "o", "n", "main").unwrap();
-        upsert_pr_for_test(&conn, repo_id, &make_pr(1)).unwrap();
+    #[tokio::test]
+    async fn query_needs_review_filter() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *conn, "o", "n", "main").await.unwrap();
+        upsert_pr_for_test(&mut *conn, repo_id, &make_pr(1)).await.unwrap();
 
         let mut pr2 = make_pr(2);
         pr2["reviews"]["nodes"] = serde_json::json!([
             { "databaseId": 1, "author": { "login": "bob" }, "state": "APPROVED", "body": "", "submittedAt": "2026-01-01T00:00:00Z" }
         ]);
-        upsert_pr_for_test(&conn, repo_id, &pr2).unwrap();
+        upsert_pr_for_test(&mut *conn, repo_id, &pr2).await.unwrap();
+        drop(conn);
 
-        // PR 1 has no approvals, PR 2 has one
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pull_request pr WHERE pr.state='open'
-                 AND (SELECT COUNT(*) FROM pr_review rv WHERE rv.pr_id=pr.id AND rv.state='APPROVED')=0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pull_request pr WHERE pr.state='open'
+             AND (SELECT COUNT(*) FROM pr_review rv WHERE rv.pr_id=pr.id AND rv.state='APPROVED')=0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(count, 1);
     }
 }

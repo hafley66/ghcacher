@@ -11,7 +11,10 @@ mod sync;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use sqlx::SqlitePool;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -152,7 +155,7 @@ fn main() -> Result<()> {
         _ => config::load(cli.config.as_deref())?,
     };
 
-    // Daemonize before tracing init so stdio redirect happens first.
+    // Daemonize before tokio runtime so we don't fork after threading starts.
     if matches!(cli.cmd, Cmd::Watch { daemon: true, .. }) {
         #[cfg(unix)]
         pidfile::daemonize()?;
@@ -166,6 +169,11 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main(cli, cfg))
+}
+
+async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
     match cli.cmd {
         Cmd::Init | Cmd::Setup | Cmd::Readme => unreachable!(),
         Cmd::Config => cmd_config(&cfg),
@@ -174,30 +182,30 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Status => {
-            let conn = db::open(&cfg.db_path)?;
-            cmd_status(&conn, &cfg)
+            let pool = db::open(&cfg.db_path).await?;
+            cmd_status(&pool, &cfg).await
         }
         Cmd::Sync { repo, prs, notifications, events } => {
-            let conn = db::open(&cfg.db_path)?;
+            let pool = db::open(&cfg.db_path).await?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold, cli.silent, cli.calls_to_stdout);
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
-            sync::run(&conn, &gh, &cfg, filter, true, &[], &[])
+            sync::run(&pool, &gh, &cfg, filter, true, &[], &[]).await
         }
         Cmd::Watch { daemon: _, no_sync } => {
             let pid_path = cfg.db_path.with_extension("pid");
             let _pid = pidfile::PidFile::acquire(&pid_path)?;
-            let conn = db::open(&cfg.db_path)?;
+            let pool = db::open(&cfg.db_path).await?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold, cli.silent, cli.calls_to_stdout);
-            let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let paused = Arc::new(AtomicBool::new(false));
             let subs = {
                 let subs = cmd::Subscriptions::new(std::time::Duration::from_secs(cfg.heartbeat_ttl_seconds));
-                let subs_server = std::sync::Arc::clone(&subs);
+                let subs_server = Arc::clone(&subs);
                 let staging = cfg.staging_folder.clone();
-                let db_path = cfg.db_path.clone();
+                let pool_cmd = pool.clone();
                 let port = cfg.cmd_port;
-                let paused_server = std::sync::Arc::clone(&paused);
-                std::thread::spawn(move || {
-                    if let Err(e) = cmd::run(subs_server, staging, db_path, port, paused_server) {
+                let paused_server = Arc::clone(&paused);
+                tokio::spawn(async move {
+                    if let Err(e) = cmd::run(subs_server, staging, pool_cmd, port, paused_server).await {
                         tracing::error!(error = %e, "cmd server exited");
                     }
                 });
@@ -205,18 +213,18 @@ fn main() -> Result<()> {
             };
             if no_sync {
                 tracing::info!("--no-sync: HTTP server running, sync loop disabled");
-                loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+                loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
             }
-            sync::watch(&conn, &gh, &cfg, subs, paused)
+            sync::watch(&pool, &gh, &cfg, subs, paused).await
         }
         Cmd::Query { sub } => {
-            let conn = db::open(&cfg.db_path)?;
-            query::run(&conn, sub)
+            let pool = db::open(&cfg.db_path).await?;
+            query::run(&pool, sub).await
         }
         Cmd::Checkout { repo, branch } => {
-            let conn = db::open(&cfg.db_path)?;
+            let pool = db::open(&cfg.db_path).await?;
             let (owner, name) = checkout::parse_slug(&repo)?;
-            checkout::checkout_one(&conn, &cfg.staging_folder, &owner, &name, &branch)
+            checkout::checkout_one(&pool, &cfg.staging_folder, &owner, &name, &branch).await
         }
     }
 }
@@ -276,31 +284,32 @@ fn cmd_config(cfg: &config::ResolvedConfig) -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(conn: &rusqlite::Connection, cfg: &config::ResolvedConfig) -> Result<()> {
-    let db_size: i64 = conn.query_row(
+async fn cmd_status(pool: &SqlitePool, cfg: &config::ResolvedConfig) -> Result<()> {
+    let db_size: i64 = sqlx::query_scalar(
         "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
-        [],
-        |r| r.get(0),
-    ).unwrap_or(0);
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
 
-    let pr_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pull_request", [], |r| r.get(0))
+    let pr_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pull_request")
+        .fetch_one(pool)
+        .await
         .unwrap_or(0);
-    let notif_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM notification WHERE unread=1", [], |r| r.get(0))
+    let notif_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification WHERE unread=1")
+        .fetch_one(pool)
+        .await
         .unwrap_or(0);
 
     println!("db:               {} ({:.1} KB)", cfg.db_path.display(), db_size as f64 / 1024.0);
     println!("pull_requests:    {}", pr_count);
     println!("unread notifs:    {}", notif_count);
 
-    let mut stmt = conn.prepare(
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT endpoint, last_polled_at, last_changed_at FROM poll_state ORDER BY last_polled_at DESC LIMIT 10",
-    )?;
-    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+    )
+    .fetch_all(pool)
+    .await?;
 
     if !rows.is_empty() {
         println!("\nrecent polls:");

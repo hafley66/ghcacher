@@ -15,19 +15,21 @@ name = "ghcache"
 path = "src/main.rs"
 
 [dependencies]
-rusqlite = { version = "0.38", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
+sqlx       = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio      = { version = "1",   features = ["full"] }
+async-trait = "0.1"
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-clap = { version = "4", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
-glob = "0.3"
-tracing = "0.1"
+toml       = "0.8"
+clap       = { version = "4", features = ["derive"] }
+chrono     = { version = "0.4", features = ["serde"] }
+dirs       = "6"
+glob       = "0.3"
+tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1"
-inquire = "0.7"
-libc = "0.2"
+anyhow     = "1"
+inquire    = "0.7"
+libc       = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

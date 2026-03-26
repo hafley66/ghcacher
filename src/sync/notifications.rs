@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use sqlx::SqliteConnection;
 
 use crate::config::ResolvedConfig;
 use crate::db::{self, ChangeEvent};
@@ -7,22 +7,20 @@ use crate::gh::{GitHubClient, GhRequest};
 
 const ENDPOINT: &str = "/notifications";
 
-/// `extra_slugs` are (owner, name) pairs from active subscriptions with
-/// `notifications: true` that are not in cfg.repos.
-pub fn sync(
-    conn: &Connection,
+pub async fn sync(
+    conn: &mut SqliteConnection,
     gh: &dyn GitHubClient,
     cfg: &ResolvedConfig,
     extra_slugs: &[(String, String)],
 ) -> Result<()> {
-    let poll = db::get_poll_state(conn, ENDPOINT)?;
+    let poll = db::get_poll_state(conn, ENDPOINT).await?;
 
     let mut req = GhRequest::get(ENDPOINT);
     if let Some(ref lm) = poll.last_modified {
         req = req.with_last_modified(lm);
     }
 
-    let resp = gh.call(conn, &req)?;
+    let resp = gh.call(conn, &req).await?;
 
     if resp.is_not_modified() {
         tracing::debug!("notifications: 304 not modified");
@@ -34,7 +32,6 @@ pub fn sync(
         None => return Ok(()),
     };
 
-    // Build set of repo slugs we care about (config + active subscriptions).
     let mut tracked_slugs: std::collections::HashSet<String> = cfg
         .repos
         .iter()
@@ -45,10 +42,8 @@ pub fn sync(
         tracked_slugs.insert(format!("{owner}/{name}"));
     }
 
-    // Preload repo_id map and existing gh_ids so upsert_notification needs no
-    // per-row SELECTs.
-    let repo_id_map = load_repo_id_map(conn)?;
-    let existing_gh_ids = load_existing_gh_ids(conn)?;
+    let repo_id_map   = load_repo_id_map(conn).await?;
+    let existing_gh_ids = load_existing_gh_ids(conn).await?;
 
     let mut upserted = 0usize;
     for thread in threads {
@@ -57,7 +52,7 @@ pub fn sync(
             continue;
         }
 
-        upsert_notification(conn, thread, &repo_id_map, &existing_gh_ids)?;
+        upsert_notification(conn, thread, &repo_id_map, &existing_gh_ids).await?;
         upserted += 1;
     }
 
@@ -65,48 +60,27 @@ pub fn sync(
     Ok(())
 }
 
-fn load_repo_id_map(conn: &Connection) -> Result<std::collections::HashMap<String, i64>> {
-    use std::collections::HashMap;
-    let mut stmt = conn.prepare("SELECT owner || '/' || name, id FROM repo")?;
-    let mut map = HashMap::new();
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let slug: String = row.get(0)?;
-        let id: i64 = row.get(1)?;
-        map.insert(slug, id);
-    }
-    Ok(map)
+async fn load_repo_id_map(conn: &mut SqliteConnection) -> Result<std::collections::HashMap<String, i64>> {
+    let rows: Vec<(String, i64)> = sqlx::query_as("SELECT owner || '/' || name, id FROM repo")
+        .fetch_all(conn)
+        .await?;
+    Ok(rows.into_iter().collect())
 }
 
-fn load_existing_gh_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    use std::collections::HashSet;
-    let mut stmt = conn.prepare("SELECT gh_id FROM notification")?;
-    let mut set = HashSet::new();
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let gh_id: String = row.get(0)?;
-        set.insert(gh_id);
-    }
-    Ok(set)
+async fn load_existing_gh_ids(conn: &mut SqliteConnection) -> Result<std::collections::HashSet<String>> {
+    let ids: Vec<String> = sqlx::query_scalar("SELECT gh_id FROM notification")
+        .fetch_all(conn)
+        .await?;
+    Ok(ids.into_iter().collect())
 }
 
-/// Converts a GitHub API subject URL to a browser HTML URL and extracts the
-/// subject number (PR number, issue number) if present.
-///
-/// API URL patterns:
-///   .../pulls/123   → .../pull/123  (note: plural → singular)
-///   .../issues/123  → .../issues/123
-///   .../commits/sha → .../commit/sha
 fn parse_subject_url(api_url: &str) -> (Option<String>, Option<i64>) {
-    // Strip API prefix: https://api.github.com/repos/{owner}/{name}/...
-    // to https://github.com/{owner}/{name}/...
     let path = if let Some(rest) = api_url.strip_prefix("https://api.github.com/repos/") {
         rest
     } else {
         return (None, None);
     };
 
-    // path is now like: owner/name/pulls/123  or  owner/name/commits/sha
     let segments: Vec<&str> = path.splitn(4, '/').collect();
     if segments.len() < 4 {
         return (None, None);
@@ -124,8 +98,8 @@ fn parse_subject_url(api_url: &str) -> (Option<String>, Option<i64>) {
     (Some(html_url), number)
 }
 
-fn upsert_notification(
-    conn: &Connection,
+async fn upsert_notification(
+    conn: &mut SqliteConnection,
     thread: &serde_json::Value,
     repo_id_map: &std::collections::HashMap<String, i64>,
     existing_gh_ids: &std::collections::HashSet<String>,
@@ -136,21 +110,21 @@ fn upsert_notification(
     };
 
     let owner = thread["repository"]["owner"]["login"].as_str().unwrap_or("");
-    let name = thread["repository"]["name"].as_str().unwrap_or("");
-    let slug = format!("{owner}/{name}");
+    let name  = thread["repository"]["name"].as_str().unwrap_or("");
+    let slug  = format!("{owner}/{name}");
     let repo_id = repo_id_map.get(&slug).copied();
-    let is_new = !existing_gh_ids.contains(gh_id);
+    let is_new  = !existing_gh_ids.contains(gh_id);
 
     let subject_url = thread["subject"]["url"].as_str();
     let (html_url, subject_number) = subject_url
         .map(parse_subject_url)
         .unwrap_or((None, None));
 
-    let notif_id: i64 = conn.query_row(
+    let notif_id: i64 = sqlx::query_scalar(
         "INSERT INTO notification
          (gh_id, repo_id, subject_type, subject_title, subject_url, subject_number, html_url,
           reason, unread, updated_at, last_read_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(gh_id) DO UPDATE SET
              subject_title  = excluded.subject_title,
              subject_url    = excluded.subject_url,
@@ -161,25 +135,24 @@ fn upsert_notification(
              updated_at     = excluded.updated_at,
              last_read_at   = excluded.last_read_at
          RETURNING id",
-        params![
-            gh_id,
-            repo_id,
-            thread["subject"]["type"].as_str().unwrap_or(""),
-            thread["subject"]["title"].as_str().unwrap_or(""),
-            subject_url,
-            subject_number,
-            html_url,
-            thread["reason"].as_str().unwrap_or(""),
-            thread["unread"].as_bool().unwrap_or(true) as i64,
-            thread["updated_at"].as_str().unwrap_or(""),
-            thread["last_read_at"].as_str(),
-        ],
-        |r| r.get(0),
-    )?;
+    )
+    .bind(gh_id)
+    .bind(repo_id)
+    .bind(thread["subject"]["type"].as_str().unwrap_or(""))
+    .bind(thread["subject"]["title"].as_str().unwrap_or(""))
+    .bind(subject_url)
+    .bind(subject_number)
+    .bind(html_url)
+    .bind(thread["reason"].as_str().unwrap_or(""))
+    .bind(thread["unread"].as_bool().unwrap_or(true) as i64)
+    .bind(thread["updated_at"].as_str().unwrap_or(""))
+    .bind(thread["last_read_at"].as_str())
+    .fetch_one(&mut *conn)
+    .await?;
 
-    let event = if is_new { ChangeEvent::Inserted } else { ChangeEvent::Updated };
+    let event    = if is_new { ChangeEvent::Inserted } else { ChangeEvent::Updated };
     let slug_opt = if owner.is_empty() { None } else { Some(slug.as_str()) };
-    db::log_change(conn, "notification", notif_id, event, slug_opt, None)?;
+    db::log_change(&mut *conn, "notification", notif_id, event, slug_opt, None).await?;
 
     Ok(())
 }
@@ -189,10 +162,10 @@ mod tests {
     use super::*;
     use crate::db;
 
-    fn do_upsert(conn: &Connection, thread: &serde_json::Value) -> Result<()> {
-        let repo_id_map = load_repo_id_map(conn)?;
-        let existing = load_existing_gh_ids(conn)?;
-        upsert_notification(conn, thread, &repo_id_map, &existing)
+    async fn do_upsert(conn: &mut SqliteConnection, thread: &serde_json::Value) {
+        let repo_id_map   = load_repo_id_map(conn).await.unwrap();
+        let existing      = load_existing_gh_ids(conn).await.unwrap();
+        upsert_notification(conn, thread, &repo_id_map, &existing).await.unwrap();
     }
 
     fn make_thread(id: &str, owner: &str, name: &str, unread: bool) -> serde_json::Value {
@@ -215,14 +188,16 @@ mod tests {
         })
     }
 
-    #[test]
-    fn upsert_notification_insert() {
-        let conn = db::open_in_memory().unwrap();
-        let thread = make_thread("thread1", "o", "n", true);
-        do_upsert(&conn, &thread).unwrap();
+    #[tokio::test]
+    async fn upsert_notification_insert() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        do_upsert(&mut *c, &make_thread("thread1", "o", "n", true)).await;
+        drop(c);
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM notification", [], |r| r.get(0))
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -258,75 +233,84 @@ mod tests {
         assert_eq!(num, None);
     }
 
-    #[test]
-    fn upsert_stores_html_url_and_number() {
-        let conn = db::open_in_memory().unwrap();
-        let thread = make_thread("t99", "o", "n", true);
-        do_upsert(&conn, &thread).unwrap();
+    #[tokio::test]
+    async fn upsert_stores_html_url_and_number() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        do_upsert(&mut *c, &make_thread("t99", "o", "n", true)).await;
+        drop(c);
 
-        let (html_url, subject_number): (Option<String>, Option<i64>) = conn
-            .query_row(
-                "SELECT html_url, subject_number FROM notification WHERE gh_id='t99'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(html_url.as_deref(), Some("https://github.com/o/n/pull/1"));
-        assert_eq!(subject_number, Some(1));
+        let row: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT html_url, subject_number FROM notification WHERE gh_id='t99'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some("https://github.com/o/n/pull/1"));
+        assert_eq!(row.1, Some(1));
     }
 
-    #[test]
-    fn upsert_notification_marks_read() {
-        let conn = db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn upsert_notification_marks_read() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        do_upsert(&mut *c, &make_thread("thread1", "o", "n", true)).await;
 
-        let thread = make_thread("thread1", "o", "n", true);
-        do_upsert(&conn, &thread).unwrap();
-
-        let mut read = thread.clone();
+        let mut read = make_thread("thread1", "o", "n", false);
         read["unread"] = serde_json::json!(false);
-        do_upsert(&conn, &read).unwrap();
+        do_upsert(&mut *c, &read).await;
+        drop(c);
 
-        let unread: i64 = conn
-            .query_row("SELECT unread FROM notification WHERE gh_id='thread1'", [], |r| r.get(0))
+        let unread: i64 = sqlx::query_scalar("SELECT unread FROM notification WHERE gh_id='thread1'")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(unread, 0);
     }
 
-    #[test]
-    fn upsert_notification_idempotent() {
-        let conn = db::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn upsert_notification_idempotent() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
         let thread = make_thread("t1", "o", "n", true);
-        do_upsert(&conn, &thread).unwrap();
-        do_upsert(&conn, &thread).unwrap();
+        do_upsert(&mut *c, &thread).await;
+        do_upsert(&mut *c, &thread).await;
+        drop(c);
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM notification", [], |r| r.get(0))
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn notification_links_repo_id() {
-        let conn = db::open_in_memory().unwrap();
-        db::upsert_repo(&conn, "o", "n", "main").unwrap();
+    #[tokio::test]
+    async fn notification_links_repo_id() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
 
-        let thread = make_thread("t1", "o", "n", true);
-        do_upsert(&conn, &thread).unwrap();
+        do_upsert(&mut *c, &make_thread("t1", "o", "n", true)).await;
+        drop(c);
 
-        let repo_id: Option<i64> = conn
-            .query_row("SELECT repo_id FROM notification WHERE gh_id='t1'", [], |r| r.get(0))
+        let repo_id: Option<i64> = sqlx::query_scalar("SELECT repo_id FROM notification WHERE gh_id='t1'")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert!(repo_id.is_some());
     }
 
-    #[test]
-    fn v_unread_view() {
-        let conn = db::open_in_memory().unwrap();
-        do_upsert(&conn, &make_thread("t1", "o", "n", true)).unwrap();
-        do_upsert(&conn, &make_thread("t2", "o", "n", false)).unwrap();
+    #[tokio::test]
+    async fn v_unread_view() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        do_upsert(&mut *c, &make_thread("t1", "o", "n", true)).await;
+        do_upsert(&mut *c, &make_thread("t2", "o", "n", false)).await;
+        drop(c);
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM v_unread_notifications", [], |r| r.get(0))
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM v_unread_notifications")
+            .fetch_one(&pool)
+            .await
             .unwrap();
         assert_eq!(count, 1);
     }

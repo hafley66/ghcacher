@@ -5,7 +5,7 @@ pub mod sql;
 
 use anyhow::Result;
 use clap::Subcommand;
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 
 use crate::output::Format;
 
@@ -86,33 +86,33 @@ pub enum QueryCmd {
     },
 }
 
-pub fn run(conn: &Connection, cmd: QueryCmd) -> Result<()> {
+pub async fn run(pool: &SqlitePool, cmd: QueryCmd) -> Result<()> {
     match cmd {
         QueryCmd::Prs { repo, state, needs_review, mine, format } => {
-            prs::query(conn, repo.as_deref(), &state, needs_review, mine, format.unwrap_or_else(Format::auto))
+            prs::query(pool, repo.as_deref(), &state, needs_review, mine, format.unwrap_or_else(Format::auto)).await
         }
         QueryCmd::Pr { number, repo, format } => {
-            prs::query_one(conn, number, &repo, format.unwrap_or_else(Format::auto))
+            prs::query_one(pool, number, &repo, format.unwrap_or_else(Format::auto)).await
         }
         QueryCmd::Notifications { mark_read, all, repo, reason, subject_type, format } => {
-            notifications::query(conn, mark_read, all, repo.as_deref(), reason.as_deref(), subject_type.as_deref(), format.unwrap_or_else(Format::auto))
+            notifications::query(pool, mark_read, all, repo.as_deref(), reason.as_deref(), subject_type.as_deref(), format.unwrap_or_else(Format::auto)).await
         }
         QueryCmd::Events { repo, r#type, format } => {
-            events::query(conn, repo.as_deref(), r#type.as_deref(), format.unwrap_or_else(Format::auto))
+            events::query(pool, repo.as_deref(), r#type.as_deref(), format.unwrap_or_else(Format::auto)).await
         }
         QueryCmd::Branches { repo, format } => {
-            query_branches(conn, repo.as_deref(), format.unwrap_or_else(Format::auto))
+            query_branches(pool, repo.as_deref(), format.unwrap_or_else(Format::auto)).await
         }
         QueryCmd::RateLimit { format } => {
-            sql::query_view(conn, "v_rate_limit", format.unwrap_or_else(Format::auto))
+            sql::query_view(pool, "v_rate_limit", format.unwrap_or_else(Format::auto)).await
         }
         QueryCmd::Sql { query, format } => {
-            sql::query_raw(conn, &query, format.unwrap_or_else(Format::auto))
+            sql::query_raw(pool, &query, format.unwrap_or_else(Format::auto)).await
         }
     }
 }
 
-fn query_branches(conn: &Connection, repo: Option<&str>, format: Format) -> Result<()> {
+async fn query_branches(pool: &SqlitePool, repo: Option<&str>, format: Format) -> Result<()> {
     let mut where_clause = String::new();
     if let Some(slug) = repo {
         let parts: Vec<&str> = slug.splitn(2, '/').collect();
@@ -132,5 +132,5 @@ fn query_branches(conn: &Connection, repo: Option<&str>, format: Format) -> Resu
          ORDER BY r.owner, r.name, b.name"
     );
 
-    sql::query_raw(conn, &query, format)
+    sql::query_raw(pool, &query, format).await
 }

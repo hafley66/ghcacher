@@ -1,11 +1,11 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use sqlx::SqlitePool;
 
 use crate::output::Format;
 use super::sql;
 
-pub fn query(
-    conn: &Connection,
+pub async fn query(
+    pool: &SqlitePool,
     mark_read: bool,
     all: bool,
     repo: Option<&str>,
@@ -54,5 +54,5 @@ pub fn query(
          ORDER BY n.updated_at DESC"
     );
 
-    sql::query_raw(conn, &query, format)
+    sql::query_raw(pool, &query, format).await
 }
