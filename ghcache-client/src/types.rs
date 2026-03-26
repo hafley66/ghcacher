@@ -87,6 +87,15 @@ pub struct RateLimit {
     pub gql_cost: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkout {
+    pub repo_slug: String,
+    pub branch: String,
+    pub local_path: String,
+    pub sha: Option<String>,
+    pub checked_out_at: String,
+}
+
 /// Filters for PR queries.
 #[derive(Debug, Default)]
 pub struct PrFilter<'a> {

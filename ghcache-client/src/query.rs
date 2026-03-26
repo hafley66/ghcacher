@@ -91,7 +91,7 @@ impl Client {
         .bind(number)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|r| Ok(PullRequest {
+        row.map(|r| Ok::<_, sqlx::Error>(PullRequest {
             id:            r.try_get(0)?,
             repo_slug:     r.try_get(1)?,
             number:        r.try_get(2)?,
@@ -254,6 +254,32 @@ impl Client {
         }).collect::<Result<Vec<_>, sqlx::Error>>().map_err(Into::into)
     }
 
+    // ---- Checkouts ------------------------------------------------------
+
+    pub async fn checkouts(&self, repo: Option<&str>) -> Result<Vec<Checkout>> {
+        let where_clause = match repo {
+            Some(r) => {
+                let (owner, name) = split_slug(r)?;
+                format!("WHERE r.owner = '{}' AND r.name = '{}'", esc(owner), esc(name))
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT r.owner || '/' || r.name, c.branch, c.local_path, c.sha, c.checked_out_at
+             FROM checkout c JOIN repo r ON r.id = c.repo_id
+             {where_clause}
+             ORDER BY r.owner, r.name, c.branch"
+        );
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+        rows.iter().map(|r| Ok(Checkout {
+            repo_slug:      r.try_get(0)?,
+            branch:         r.try_get(1)?,
+            local_path:     r.try_get(2)?,
+            sha:            r.try_get(3)?,
+            checked_out_at: r.try_get(4)?,
+        })).collect::<Result<Vec<_>, sqlx::Error>>().map_err(Into::into)
+    }
+
     // ---- Rate limit -----------------------------------------------------
 
     pub async fn rate_limit(&self) -> Result<Vec<RateLimit>> {
@@ -342,6 +368,52 @@ mod tests {
     #[test]
     fn split_slug_missing_name() {
         assert!(split_slug("noname").is_err());
+    }
+
+    #[tokio::test]
+    async fn checkouts_empty() {
+        let client = setup().await;
+        let checkouts = client.checkouts(None).await.unwrap();
+        assert!(checkouts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkouts_returns_rows() {
+        let client = setup().await;
+        sqlx::query("INSERT INTO repo (owner, name, default_branch) VALUES ('myorg', 'backend', 'main')")
+            .execute(&client.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO checkout (repo_id, branch, local_path, sha, checked_out_at)
+             VALUES (1, 'main', '/tmp/staging/myorg/backend/main', 'abc123', '2026-03-26T00:00:00Z')"
+        )
+            .execute(&client.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO checkout (repo_id, branch, local_path, sha, checked_out_at)
+             VALUES (1, 'feature/x', '/tmp/staging/myorg/backend/feature-x', 'def456', '2026-03-26T00:00:00Z')"
+        )
+            .execute(&client.pool)
+            .await
+            .unwrap();
+
+        let all = client.checkouts(None).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].repo_slug, "myorg/backend");
+        assert_eq!(all[0].branch, "feature/x");
+        assert_eq!(all[0].local_path, "/tmp/staging/myorg/backend/feature-x");
+        assert_eq!(all[0].sha.as_deref(), Some("def456"));
+        assert_eq!(all[1].branch, "main");
+        assert_eq!(all[1].local_path, "/tmp/staging/myorg/backend/main");
+        assert_eq!(all[1].sha.as_deref(), Some("abc123"));
+
+        let filtered = client.checkouts(Some("myorg/backend")).await.unwrap();
+        assert_eq!(filtered.len(), 2);
+
+        let empty = client.checkouts(Some("other/repo")).await.unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
