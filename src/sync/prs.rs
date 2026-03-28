@@ -13,6 +13,14 @@ const PR_FIELDS: &str = r#"number title state isDraft body
               reviews(last: 20) {
                 nodes { databaseId author { login } state body submittedAt }
               }
+              reviewRequests(first: 20) {
+                nodes {
+                  requestedReviewer {
+                    ... on User { login }
+                    ... on Team { name: slug }
+                  }
+                }
+              }
               labels(first: 10) {
                 nodes { name color }
               }
@@ -238,6 +246,28 @@ async fn upsert_pr(
         }
     }
 
+    // Requested reviewers: delete-and-replace (like labels)
+    sqlx::query("DELETE FROM pr_requested_reviewer WHERE pr_id = ?")
+        .bind(pr_id)
+        .execute(&mut *conn)
+        .await?;
+    if let Some(requests) = pr["reviewRequests"]["nodes"].as_array() {
+        for req in requests {
+            let reviewer = req["requestedReviewer"]["login"]
+                .as_str()
+                .or_else(|| req["requestedReviewer"]["name"].as_str());
+            if let Some(name) = reviewer {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO pr_requested_reviewer (pr_id, reviewer) VALUES (?, ?)",
+                )
+                .bind(pr_id)
+                .bind(name)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+    }
+
     if let Some(commits) = pr["commits"]["nodes"].as_array() {
         if let Some(commit) = commits.first() {
             if let Some(contexts) = commit["commit"]["statusCheckRollup"]["contexts"]["nodes"].as_array() {
@@ -420,6 +450,64 @@ mod tests {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pr_label")
             .fetch_one(&mut *c).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn requested_reviewers_synced() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+
+        let mut pr = make_pr(1, "OPEN", "x");
+        pr["reviewRequests"] = serde_json::json!({"nodes": [
+            {"requestedReviewer": {"login": "bob"}},
+            {"requestedReviewer": {"login": "carol"}},
+        ]});
+        upsert_pr_for_test(&mut *c, repo_id, &pr).await.unwrap();
+
+        let reviewers: Vec<String> = sqlx::query_scalar(
+            "SELECT reviewer FROM pr_requested_reviewer WHERE pr_id = 1 ORDER BY reviewer",
+        )
+        .fetch_all(&mut *c)
+        .await
+        .unwrap();
+        assert_eq!(reviewers, vec!["bob", "carol"]);
+
+        // Update: remove carol, add dave
+        pr["reviewRequests"] = serde_json::json!({"nodes": [
+            {"requestedReviewer": {"login": "bob"}},
+            {"requestedReviewer": {"login": "dave"}},
+        ]});
+        upsert_pr_for_test(&mut *c, repo_id, &pr).await.unwrap();
+
+        let reviewers: Vec<String> = sqlx::query_scalar(
+            "SELECT reviewer FROM pr_requested_reviewer WHERE pr_id = 1 ORDER BY reviewer",
+        )
+        .fetch_all(&mut *c)
+        .await
+        .unwrap();
+        assert_eq!(reviewers, vec!["bob", "dave"]);
+    }
+
+    #[tokio::test]
+    async fn requested_reviewers_team() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+
+        let mut pr = make_pr(1, "OPEN", "x");
+        pr["reviewRequests"] = serde_json::json!({"nodes": [
+            {"requestedReviewer": {"name": "platform-team"}},
+        ]});
+        upsert_pr_for_test(&mut *c, repo_id, &pr).await.unwrap();
+
+        let reviewers: Vec<String> = sqlx::query_scalar(
+            "SELECT reviewer FROM pr_requested_reviewer WHERE pr_id = 1",
+        )
+        .fetch_all(&mut *c)
+        .await
+        .unwrap();
+        assert_eq!(reviewers, vec!["platform-team"]);
     }
 
     #[tokio::test]

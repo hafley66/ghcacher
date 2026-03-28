@@ -78,6 +78,10 @@ pub async fn sync(
 
             if let Some(pr_num) = pr_number_from_event(ev_type, payload) {
                 dirty_prs.push(pr_num);
+            } else if let Some(sha) = sha_from_ci_event(ev_type, payload) {
+                if let Some(pr_num) = pr_number_from_sha(conn, repo_id, sha).await {
+                    dirty_prs.push(pr_num);
+                }
             }
         }
         inserted += rows_affected as usize;
@@ -85,6 +89,15 @@ pub async fn sync(
 
     tracing::info!(repo = %slug, inserted, total = events.len(), dirty_prs = dirty_prs.len(), "events synced");
     Ok(dirty_prs)
+}
+
+fn sha_from_ci_event<'a>(ev_type: &str, payload: &'a serde_json::Value) -> Option<&'a str> {
+    match ev_type {
+        "StatusEvent" => payload["sha"].as_str(),
+        "CheckRunEvent" => payload["check_run"]["head_sha"].as_str(),
+        "CheckSuiteEvent" => payload["check_suite"]["head_sha"].as_str(),
+        _ => None,
+    }
 }
 
 /// Sync all events for a GitHub org in one call. Returns repo name → dirty PR numbers.
@@ -176,6 +189,10 @@ pub async fn sync_org(
                 db::log_change(conn, "repo_event", row_id, ChangeEvent::Inserted, Some(full_slug), None).await?;
                 if let Some(pr_num) = pr_number_from_event(ev_type, payload) {
                     dirty.entry(repo_name.to_string()).or_default().push(pr_num);
+                } else if let Some(sha) = sha_from_ci_event(ev_type, payload) {
+                    if let Some(pr_num) = pr_number_from_sha(conn, repo_id, sha).await {
+                        dirty.entry(repo_name.to_string()).or_default().push(pr_num);
+                    }
                 }
             }
         }
@@ -192,6 +209,20 @@ fn pr_number_from_event(ev_type: &str, payload: &serde_json::Value) -> Option<i6
         "PullRequestReviewEvent" => payload["pull_request"]["number"].as_i64(),
         _ => None,
     }
+}
+
+/// StatusEvent/CheckRunEvent carry a commit SHA, not a PR number.
+/// Look up the open PR with that head_sha.
+async fn pr_number_from_sha(conn: &mut SqliteConnection, repo_id: i64, sha: &str) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT number FROM pull_request WHERE repo_id = ? AND head_sha = ? AND state = 'open'",
+    )
+    .bind(repo_id)
+    .bind(sha)
+    .fetch_optional(&mut *conn)
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
@@ -265,6 +296,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn status_event_triggers_pr_resync_via_sha() {
+        use super::*;
+
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+
+        // Insert an open PR with a known head_sha
+        sqlx::query(
+            "INSERT INTO pull_request
+             (repo_id, number, state, title, head_sha, head_ref, base_ref, draft, created_at, updated_at)
+             VALUES (?, 42, 'open', 'Test PR', 'deadbeef', 'feature', 'main', 0, '2026-01-01', '2026-01-01')",
+        )
+        .bind(repo_id)
+        .execute(&mut *c)
+        .await
+        .unwrap();
+
+        // StatusEvent with matching SHA should find the PR
+        let pr = pr_number_from_sha(&mut *c, repo_id, "deadbeef").await;
+        assert_eq!(pr, Some(42));
+
+        // Unknown SHA returns None
+        let pr = pr_number_from_sha(&mut *c, repo_id, "unknown").await;
+        assert_eq!(pr, None);
+
+        // sha_from_ci_event extracts correctly
+        let payload = serde_json::json!({"sha": "deadbeef", "state": "success"});
+        assert_eq!(sha_from_ci_event("StatusEvent", &payload), Some("deadbeef"));
+
+        let payload = serde_json::json!({"check_run": {"head_sha": "abc123"}});
+        assert_eq!(sha_from_ci_event("CheckRunEvent", &payload), Some("abc123"));
+
+        let payload = serde_json::json!({"check_suite": {"head_sha": "def456"}});
+        assert_eq!(sha_from_ci_event("CheckSuiteEvent", &payload), Some("def456"));
+
+        assert_eq!(sha_from_ci_event("PushEvent", &serde_json::json!({})), None);
     }
 
     #[tokio::test]

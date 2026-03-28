@@ -87,6 +87,12 @@ CREATE TABLE IF NOT EXISTS pr_label (
     PRIMARY KEY (pr_id, label)
 );
 
+CREATE TABLE IF NOT EXISTS pr_requested_reviewer (
+    pr_id           INTEGER NOT NULL REFERENCES pull_request(id),
+    reviewer        TEXT NOT NULL,
+    PRIMARY KEY (pr_id, reviewer)
+);
+
 CREATE TABLE IF NOT EXISTS repo_event (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_id         INTEGER NOT NULL REFERENCES repo(id),
