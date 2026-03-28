@@ -341,7 +341,13 @@ pub async fn watch(
 
         let interval = cfg.poll_interval_seconds;
         tracing::debug!(sleep_seconds = interval, "watch sleeping");
-        tokio::time::sleep(Duration::from_secs(interval)).await;
+        if let Some(s) = &subs {
+            if s.wait_for_sync(Duration::from_secs(interval)).await {
+                tracing::debug!("watch woken by new subscription");
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+        }
     }
 }
 

@@ -46,6 +46,7 @@ struct Sub {
 pub struct Subscriptions {
     inner: RwLock<HashMap<String, Sub>>,
     ttl: Duration,
+    sync_notify: tokio::sync::Notify,
 }
 
 impl Subscriptions {
@@ -53,7 +54,20 @@ impl Subscriptions {
         Arc::new(Self {
             inner: RwLock::new(HashMap::new()),
             ttl,
+            sync_notify: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Wake the watch loop so it syncs immediately.
+    pub fn notify_sync(&self) {
+        self.sync_notify.notify_one();
+    }
+
+    /// Wait until notified or timeout. Returns `true` if woken by notify.
+    pub async fn wait_for_sync(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.sync_notify.notified())
+            .await
+            .is_ok()
     }
 
     fn upsert(&self, uuid: String, owner: String, repo: String, pr_sync: bool, notifications: bool) {
@@ -68,7 +82,10 @@ impl Subscriptions {
                 r.pr_sync = r.pr_sync || pr_sync;
                 r.notifications = r.notifications || notifications;
             }
-            None => sub.repos.push(RepoSub { owner, repo, pr_sync, notifications }),
+            None => {
+                sub.repos.push(RepoSub { owner, repo, pr_sync, notifications });
+                self.sync_notify.notify_one();
+            }
         }
     }
 
