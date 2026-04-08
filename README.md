@@ -359,3 +359,122 @@ Progressive back-off increases sleep duration as capacity drops further.
 - Those PR numbers are batched into a single aliased GraphQL query per repo (targeted sync)
 - `change_log` is an append-only table; the HTTP `/events` SSE endpoint tails it and pushes rows to subscribers
 - `ghcache-client` is a companion Rust library with typed queries and an `EventStream` for the SSE feed -- see [ghcache-client/README.md](ghcache-client/README.md)
+
+## Appendix: Security & I/O Bill of Materials
+
+This section documents every I/O boundary in ghcache: what crosses the process boundary, in which direction, with what cardinality, and what security properties constrain it.
+
+### I/O Boundary Summary
+
+| Boundary | Direction | Cardinality | Auth | Notes |
+|----------|-----------|-------------|------|-------|
+| `gh api` (REST) | Outbound | 1 call per endpoint per poll interval per repo | Delegated to `gh` CLI | ETag/Last-Modified; most polls are free 304s |
+| `gh api graphql` | Outbound | 1 call per repo per sync pass (batched) | Delegated to `gh` CLI | Multiple PRs aliased into single query |
+| `gh repo clone` | Outbound | 1 per repo (first checkout only) | Delegated to `gh` CLI | Subsequent updates use `git fetch` |
+| `git fetch` / `git reset` | Outbound | 1 per branch per sync pass (SHA-gated) | System SSH/git config | Skipped if DB SHA matches checkout SHA |
+| HTTP server | Inbound | N concurrent SSE clients + command POSTs | None (loopback-only) | Bound to `127.0.0.1`, not `0.0.0.0` |
+| SQLite writes | Local | 1 upsert per entity per sync pass | Filesystem permissions | WAL mode, foreign keys enforced |
+| `change_log` inserts | Local | 1 per entity mutation (append-only) | Filesystem permissions | Immutable audit trail, tailed by SSE |
+| `call_log` inserts | Local | 1 per API call (append-only) | Filesystem permissions | Rate limit telemetry, never updated |
+| Config file read | Local | 1 at startup | Filesystem permissions | Read-only after startup |
+| Pidfile | Local | 1 write at startup, 1 delete on exit | Filesystem permissions | Prevents concurrent instances |
+| stdout JSON lines | Local | 1 per API call (opt-in) | Process stdout | Rate limit summaries and per-call detail |
+
+### External CLI Calls
+
+All GitHub API access goes through the `gh` CLI binary (configurable via `gh_binary` in config).
+
+| Command | Purpose | Source Location |
+|---------|---------|-----------------|
+| `gh api --include <endpoint>` | REST API calls (all endpoints) | `src/gh.rs:177` |
+| `gh api graphql --include -f query=...` | GraphQL queries | `src/gh.rs:263` |
+| `gh repo clone <slug> <dest> -- --branch <branch>` | Initial git checkout | `src/checkout.rs:173` |
+| `gh repo clone <slug> <dest>` | Ensure repo for HTTP subscriber | `src/cmd.rs:383` |
+
+**REST Endpoints Called:**
+
+| Endpoint | Purpose | Source |
+|----------|---------|--------|
+| `/repos/{owner}/{name}/events` | Repo activity events | `src/sync/events.rs:16` |
+| `/orgs/{owner}/events` | Org-wide activity events | `src/sync/events.rs:109` |
+| `/repos/{owner}/{name}/branches` | Branch SHAs | `src/sync/branches.rs:15` |
+| `/notifications` | User notifications | `src/sync/notifications.rs:8` |
+| `/orgs/{owner}/repos` | Discover org repos | `src/sync/mod.rs:48` |
+| `/users/{owner}/repos` | Discover user repos | `src/sync/mod.rs:49` |
+| `graphql` | PR data (full + targeted) | `src/sync/prs.rs:74,130` |
+
+### Git Commands
+
+| Command | Purpose | Source Location |
+|---------|---------|-----------------|
+| `git -C <path> fetch origin <branch>` | Update existing checkout | `src/checkout.rs:188` |
+| `git -C <path> reset --hard FETCH_HEAD` | Reset to fetched SHA | `src/checkout.rs:195` |
+| `git -C <path> fetch --all` | Fetch all refs (HTTP subscribe) | `src/cmd.rs:388` |
+
+### HTTP Server
+
+Binds to `127.0.0.1:{cmd_port}` (default `7748`). Loopback only -- not exposed externally.
+
+| Method | Endpoint | Body | Response | Source |
+|--------|----------|------|----------|--------|
+| `GET` | `/events` | -- | SSE stream of `change_log` rows | `src/cmd.rs:320` |
+| `POST` | `/subscribe` | `{"uuid","owner","repo","pr_sync","notifications"}` | `{"path":"..."}` | `src/cmd.rs:333` |
+| `POST` | `/heartbeat` | `{"uuid"}` | `{"ok":bool}` | `src/cmd.rs:340` |
+| `POST` | `/pause` | -- | `{"ok":true}` | `src/cmd.rs:345` |
+| `POST` | `/resume` | -- | `{"ok":true}` | `src/cmd.rs:350` |
+
+### Filesystem Operations
+
+| Path | Operation | Purpose | Source |
+|------|-----------|---------|--------|
+| `ghcache.toml` (various locations) | Read | Config loading | `src/config.rs:110` |
+| `~/.config/ghcache/config.toml` | Write (via `init`) | Template creation | `src/main.rs:268` |
+| `{db_path}` (default `~/.local/share/ghcache/gh.db`) | Read/Write | SQLite database | `src/db.rs` |
+| `{staging_folder}/{owner}/{repo}/` | Read/Write | Git checkouts | `src/checkout.rs` |
+| `{db_path}.pid` | Write/Delete | Pidfile for instance lock | `src/pidfile.rs` |
+
+### SQLite Schema
+
+| Table | Purpose | Write Pattern | Cardinality |
+|-------|---------|---------------|-------------|
+| `repo` | Configured repos | Upsert | 1 per configured repo |
+| `branch` | Branch SHAs | Upsert | 1 per tracked branch per repo |
+| `pull_request` | PR metadata | Upsert | 1 per open PR per repo per sync |
+| `pr_review` | PR review states | Upsert | N per PR (one per reviewer) |
+| `pr_label` | PR labels (junction) | Delete + Insert | N per PR (replaced in full each sync) |
+| `pr_requested_reviewer` | Requested reviewers (junction) | Delete + Insert | N per PR (replaced in full each sync) |
+| `pr_status_check` | CI status checks | Upsert | N per PR (one per context) |
+| `notification` | GitHub notifications | Upsert | 1 per notification |
+| `repo_event` | Raw event payloads | `INSERT OR IGNORE` | Idempotent; bounded by Events API page size |
+| `checkout` | Last checkout SHA per branch | Upsert | 1 per checked-out branch |
+| `call_log` | Every API call with rate limit data | Append-only | 1 row per API call, never deleted |
+| `change_log` | Entity change events (IPC bus) | Append-only | 1 row per entity mutation, never deleted |
+| `poll_state` | ETag/Last-Modified per endpoint | Upsert | 1 per polled endpoint |
+| `subscription` | HTTP subscriber state | In-memory | Transient, not persisted |
+
+### Data Leaving the Machine
+
+| Data | Destination | Trigger | Cardinality |
+|------|-------------|---------|-------------|
+| GitHub API requests (repo/org/branch identifiers, pagination cursors, ETags) | `api.github.com` | Sync operations | Bounded by configured repos x poll interval |
+| SSE events to local subscribers | `127.0.0.1:{cmd_port}` | `change_log` inserts | 1 broadcast per mutation per connected client |
+
+### Data Stored Locally
+
+| Data | Sensitivity | Location |
+|------|-------------|----------|
+| GitHub API responses (PR content, event payloads) | Medium | SQLite `*_json` columns |
+| Rate limit state | Low | SQLite `call_log`, `poll_state` |
+| Git repository contents | High (full source code) | `{staging_folder}` |
+| Auth tokens | **None** | Delegated to `gh` CLI keychain |
+
+### Security Properties
+
+- **No tokens stored** -- auth delegated to `gh` CLI (uses OS keychain). ghcache never reads, logs, or caches credentials.
+- **Loopback-only HTTP** -- command server binds `127.0.0.1`, not `0.0.0.0`. No authentication on the HTTP server; security relies on network isolation.
+- **No outbound HTTP client** -- all network egress goes through `gh` subprocess invocation, not a direct HTTP client in the ghcache process.
+- **Conditional requests** -- ETag/Last-Modified headers on every REST call minimize data transfer and API quota consumption.
+- **Idempotent writes** -- `INSERT OR IGNORE` / `ON CONFLICT DO UPDATE` prevent duplication from retries or overlapping syncs.
+- **Append-only audit logs** -- `call_log` and `change_log` are insert-only with auto-timestamps. No UPDATE or DELETE operations target these tables.
+- **PID-based instance lock** -- pidfile with `libc::kill(pid, 0)` liveness check prevents concurrent watch daemons on the same database.
+- **No user-controlled SQL** -- dynamic query construction in `query/prs.rs` uses manual escaping (`'` to `''`), not string interpolation of raw input.
