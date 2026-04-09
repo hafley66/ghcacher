@@ -177,6 +177,13 @@ pub async fn run(
             if &repo.slug() != slug { continue; }
         }
 
+        // For org repos in targeted mode, skip entirely if no events this pass.
+        let is_org_repo = org_owners.contains(&repo.owner);
+        let org_has_activity = org_dirty.contains_key(&(repo.owner.clone(), repo.name.clone()));
+        if !full_sweep && is_org_repo && !org_has_activity && filter.all() {
+            continue;
+        }
+
         tracing::info!(repo = %repo.slug(), full_sweep, "syncing");
 
         // Throttle outside the per-repo transaction.
@@ -194,7 +201,7 @@ pub async fn run(
             let repo_id = db::upsert_repo(&mut *tx, &repo.owner, &repo.name, default_branch).await?;
 
             if filter.do_events() && repo.sync_events.unwrap_or(false) {
-                if org_owners.contains(&repo.owner) {
+                if is_org_repo {
                     dirty_prs = org_dirty
                         .get(&(repo.owner.clone(), repo.name.clone()))
                         .cloned()

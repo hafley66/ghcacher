@@ -123,7 +123,7 @@ pub async fn checkout_all(
             Op::Clone => {
                 let slug = format!("{owner}/{name}");
                 handles.push(tokio::spawn(async move {
-                    run_clone(&slug, &branch, &local_path).await?;
+                    run_clone(&slug, &local_path).await?;
                     Ok((repo_id, branch, local_path, new_sha))
                 }));
             }
@@ -166,21 +166,23 @@ pub async fn checkout_all(
     Ok(())
 }
 
-async fn run_clone(slug: &str, branch: &str, dest: &Path) -> Result<()> {
+async fn run_clone(slug: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("creating {}", parent.display()))?;
     }
+    // Clone without --branch so it gets whatever the repo's default branch is.
+    // Repos in an org may use "main", "master", or something else entirely.
     let status = Command::new("gh")
-        .args(["repo", "clone", slug, &dest.to_string_lossy(), "--", "--branch", branch])
+        .args(["repo", "clone", slug, &dest.to_string_lossy()])
         .status()
         .await
         .context("gh repo clone")?;
     if !status.success() {
-        bail!("gh repo clone {slug} --branch {branch} exited {status}");
+        bail!("gh repo clone {slug} exited {status}");
     }
-    tracing::info!(%slug, %branch, path = %dest.display(), "cloned");
+    tracing::info!(%slug, path = %dest.display(), "cloned");
     Ok(())
 }
 
@@ -193,7 +195,8 @@ async fn run_fetch(path: &Path, branch: &str) -> Result<()> {
         .await
         .context("git fetch")?;
     if !fetch.success() {
-        bail!("git fetch origin {branch} failed in {}", path.display());
+        tracing::warn!(path = %path.display(), %branch, "branch not found on remote, skipping");
+        return Ok(());
     }
 
     let reset = Command::new("git")
