@@ -60,45 +60,64 @@ pub async fn sync(
     owner: &str,
     name: &str,
 ) -> Result<()> {
-    tracing::debug!(repo = %format!("{owner}/{name}"), "syncing PRs via GraphQL (full)");
-    gh.throttle_if_needed(conn, "graphql").await?;
+    sync_batch(conn, gh, &[(repo_id, owner.to_owned(), name.to_owned())]).await
+}
 
-    let inlined = format!(
-        r#"{{ repository(owner: "{owner}", name: "{name}") {{
-          pullRequests(first: 100, states: OPEN, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
-            nodes {{ {PR_FIELDS} }}
-          }}
-        }} }}"#
-    );
+/// Fetch open PRs for multiple repos in a single aliased GraphQL query.
+/// Repos are batched into groups of BATCH_SIZE to stay within query limits.
+const BATCH_SIZE: usize = 20;
 
-    let endpoint = format!("graphql:prs:full/{owner}/{name}");
-    let data  = gh.graphql(conn, &endpoint, &inlined).await?;
-    let nodes = &data["repository"]["pullRequests"]["nodes"];
-    let nodes = match nodes.as_array() {
-        Some(a) => a,
-        None => {
-            tracing::warn!("no PR nodes returned");
-            return Ok(());
+pub async fn sync_batch(
+    conn: &mut SqliteConnection,
+    gh: &dyn GitHubClient,
+    repos: &[(i64, String, String)],
+) -> Result<()> {
+    if repos.is_empty() { return Ok(()); }
+
+    for chunk in repos.chunks(BATCH_SIZE) {
+        gh.throttle_if_needed(conn, "graphql").await?;
+
+        let aliases: String = chunk.iter().enumerate().map(|(i, (_, owner, name))| {
+            format!(
+                "  repo_{i}: repository(owner: \"{owner}\", name: \"{name}\") {{\n\
+                 \x20   pullRequests(first: 100, states: OPEN, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{\n\
+                 \x20     nodes {{ {PR_FIELDS} }}\n\
+                 \x20   }}\n\
+                 \x20 }}"
+            )
+        }).collect::<Vec<_>>().join("\n");
+
+        let query = format!("{{ \n{aliases}\n }}");
+        let owners: Vec<&str> = chunk.iter().map(|(_, o, _)| o.as_str()).collect();
+        let endpoint = format!("graphql:prs:batch/{}", owners.first().unwrap_or(&"?"));
+        let data = gh.graphql(conn, &endpoint, &query).await?;
+
+        for (i, (repo_id, owner, name)) in chunk.iter().enumerate() {
+            let key = format!("repo_{i}");
+            let nodes = &data[&key]["pullRequests"]["nodes"];
+            let nodes = match nodes.as_array() {
+                Some(a) => a,
+                None => continue,
+            };
+
+            let slug = format!("{owner}/{name}");
+            let existing: std::collections::HashSet<i64> = sqlx::query_scalar(
+                "SELECT number FROM pull_request WHERE repo_id=?",
+            )
+            .bind(repo_id)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+
+            for pr in nodes {
+                let number = pr["number"].as_i64().unwrap_or(0);
+                upsert_pr(conn, *repo_id, &slug, pr, !existing.contains(&number)).await?;
+            }
+
+            tracing::info!(repo = %slug, count = nodes.len(), "PRs synced");
         }
-    };
-
-    let slug = format!("{owner}/{name}");
-
-    let existing: std::collections::HashSet<i64> = sqlx::query_scalar(
-        "SELECT number FROM pull_request WHERE repo_id=?",
-    )
-    .bind(repo_id)
-    .fetch_all(&mut *conn)
-    .await?
-    .into_iter()
-    .collect();
-
-    for pr in nodes {
-        let number = pr["number"].as_i64().unwrap_or(0);
-        upsert_pr(conn, repo_id, &slug, pr, !existing.contains(&number)).await?;
     }
-
-    tracing::info!(repo = %format!("{owner}/{name}"), count = nodes.len(), "PRs synced");
     Ok(())
 }
 

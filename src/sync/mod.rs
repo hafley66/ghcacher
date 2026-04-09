@@ -169,7 +169,10 @@ pub async fn run(
         .chain(extra_repos.iter())
         .collect();
 
-    for repo in all_repos {
+    // Collect repos needing a full-sweep PR fetch so we can batch them.
+    let mut pr_batch: Vec<(i64, String, String)> = vec![];
+
+    for repo in &all_repos {
         if let Some(ref slug) = filter.repo {
             if &repo.slug() != slug { continue; }
         }
@@ -184,6 +187,7 @@ pub async fn run(
 
         let mut tx = pool.begin().await?;
         let mut dirty_prs: Vec<i64> = vec![];
+        let mut needs_pr_batch = false;
 
         let result: Result<()> = async {
             let default_branch = repo.default_branch.as_deref().unwrap_or("main");
@@ -202,7 +206,7 @@ pub async fn run(
 
             if filter.do_prs() && repo.sync_prs.unwrap_or(false) {
                 if full_sweep || filter.prs_only {
-                    prs::sync(&mut *tx, gh, repo_id, &repo.owner, &repo.name).await?;
+                    needs_pr_batch = true;
                 } else {
                     prs::sync_targeted(&mut *tx, gh, repo_id, &repo.owner, &repo.name, &dirty_prs).await?;
                 }
@@ -229,7 +233,20 @@ pub async fn run(
             let _ = tx.rollback().await;
         } else {
             tx.commit().await?;
+            // Only add to batch after successful commit so repo_id is durable.
+            if needs_pr_batch {
+                let mut c = pool.acquire().await?;
+                if let Ok(Some(repo_id)) = db::get_repo_id(&mut *c, &repo.owner, &repo.name).await {
+                    pr_batch.push((repo_id, repo.owner.clone(), repo.name.clone()));
+                }
+            }
         }
+    }
+
+    // Batched full-sweep PR sync: packs multiple repos per GraphQL call.
+    if !pr_batch.is_empty() {
+        let mut conn = pool.acquire().await?;
+        prs::sync_batch(&mut *conn, gh, &pr_batch).await?;
     }
 
     let notifs_needed = filter.do_notifs()
@@ -250,9 +267,26 @@ pub async fn watch(
     cfg: &ResolvedConfig,
     subs: Option<std::sync::Arc<crate::cmd::Subscriptions>>,
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    force_full_sweep: bool,
 ) -> Result<()> {
     tracing::info!("starting watch loop");
-    let mut first_run = true;
+    let mut first_run = if force_full_sweep {
+        true
+    } else {
+        // Skip full sweep on startup if we have cached PR data.
+        let has_data: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pull_request LIMIT 1)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+        if has_data {
+            tracing::info!("skipping full sweep: PR data is cached and up to date (use --full-sweep to force)");
+            false
+        } else {
+            true
+        }
+    };
     loop {
         if paused.load(std::sync::atomic::Ordering::Relaxed) {
             tracing::debug!("sync paused");
@@ -409,14 +443,47 @@ mod tests {
     async fn full_sweep_calls_graphql_once() {
         let pool = db::open_in_memory().await.unwrap();
         let mock = MockGhClient::new();
-        mock.push_rest(serde_json::json!([]));
-        mock.push_graphql(serde_json::json!({"repository": {"pullRequests": {"nodes": []}}}));
+        mock.push_rest(serde_json::json!([])); // events
+        mock.push_graphql(serde_json::json!({"repo_0": {"pullRequests": {"nodes": []}}}));
 
         run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), true, &[], &[]).await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 1);
         let (endpoint, _) = &mock.graphql_calls.lock().unwrap()[0];
-        assert!(endpoint.contains("full"), "expected full endpoint, got {endpoint}");
+        assert!(endpoint.starts_with("graphql:prs:batch/"), "expected batch endpoint, got {endpoint}");
+    }
+
+    #[tokio::test]
+    async fn full_sweep_batches_multiple_repos() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mock = MockGhClient::new();
+        // 2 repos: each gets an events REST call (304), then 1 batched GraphQL call
+        mock.push_rest_304(); // events repo A
+        mock.push_rest_304(); // events repo B
+        // Single batch response covering both repos
+        mock.push_graphql(serde_json::json!({
+            "repo_0": {"pullRequests": {"nodes": []}},
+            "repo_1": {"pullRequests": {"nodes": []}}
+        }));
+
+        let mut cfg = cfg_with_repo("o", "a");
+        cfg.repos.push(RepoConfig {
+            owner: "o".into(),
+            name: "b".into(),
+            default_branch: Some("main".into()),
+            sync_prs: Some(true),
+            sync_events: Some(true),
+            sync_notifications: Some(false),
+            sync_branches: None,
+            checkout_on_sync: None,
+            poll_interval_seconds: None,
+            fs_alias: None,
+        });
+
+        run(&pool, &mock, &cfg, all_filter(), true, &[], &[]).await.unwrap();
+
+        // Both repos should be packed into a single GraphQL call
+        assert_eq!(mock.graphql_call_count(), 1, "expected 1 batched GraphQL call, got {}", mock.graphql_call_count());
     }
 
     #[tokio::test]

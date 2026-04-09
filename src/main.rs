@@ -114,6 +114,9 @@ enum Cmd {
         /// Start HTTP server only; skip sync loop
         #[arg(long)]
         no_sync: bool,
+        /// Force a full sweep on startup even if data is cached
+        #[arg(long)]
+        full_sweep: bool,
     },
     /// Query cached data
     Query {
@@ -191,7 +194,7 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
             sync::run(&pool, &gh, &cfg, filter, true, &[], &[]).await
         }
-        Cmd::Watch { daemon: _, no_sync } => {
+        Cmd::Watch { daemon: _, no_sync, full_sweep } => {
             let pid_path = cfg.db_path.with_extension("pid");
             let _pid = pidfile::PidFile::acquire(&pid_path)?;
             let pool = db::open(&cfg.db_path).await?;
@@ -216,7 +219,7 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
                 tracing::info!("--no-sync: HTTP server running, sync loop disabled");
                 loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
             }
-            sync::watch(&pool, &gh, &cfg, subs, paused).await
+            sync::watch(&pool, &gh, &cfg, subs, paused, full_sweep).await
         }
         Cmd::Query { sub } => {
             let pool = db::open(&cfg.db_path).await?;
