@@ -173,7 +173,13 @@ impl GitHubClient for GhClient {
 
     async fn call(&self, conn: &mut SqliteConnection, req: &GhRequest<'_>) -> Result<GhResponse> {
         let mut cmd = Command::new(&self.binary);
-        cmd.arg("api").arg("--include");
+        cmd.arg("api");
+        // --include gives us headers (etag, rate limit), but combined with
+        // --paginate it emits a separate HTTP block per page, and parse_response
+        // only keeps the last block's body. Skip --include for paginated calls.
+        if !req.paginate {
+            cmd.arg("--include");
+        }
 
         if req.method != "GET" {
             cmd.arg("-X").arg(req.method);
@@ -204,15 +210,20 @@ impl GitHubClient for GhClient {
         let duration_ms = t.elapsed().as_millis() as u64;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let (status, headers, body_str) = parse_response(&stdout)?;
 
-        let body: serde_json::Value = if body_str.trim().is_empty() || status == 304 {
-            serde_json::Value::Null
-        } else if req.paginate {
-            parse_paginated_body(body_str)?
+        let (status, headers, body) = if req.paginate {
+            // No --include, so stdout is raw JSON (no HTTP headers to parse)
+            let body = parse_paginated_body(&stdout)?;
+            (200, HashMap::new(), body)
         } else {
-            serde_json::from_str(body_str)
-                .with_context(|| format!("parsing JSON body for {}", req.endpoint))?
+            let (status, headers, body_str) = parse_response(&stdout)?;
+            let body = if body_str.trim().is_empty() || status == 304 {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(body_str)
+                    .with_context(|| format!("parsing JSON body for {}", req.endpoint))?
+            };
+            (status, headers, body)
         };
 
         let resp = GhResponse { status, headers, body, duration_ms };

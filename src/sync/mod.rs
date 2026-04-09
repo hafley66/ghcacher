@@ -45,10 +45,20 @@ async fn discover_org_repos(
     gh: &dyn GitHubClient,
     owner: &str,
 ) -> Result<Vec<String>> {
-    let org_endpoint  = format!("/orgs/{owner}/repos");
-    let user_endpoint = format!("/users/{owner}/repos");
+    let org_endpoint  = format!("/orgs/{owner}/repos?per_page=100");
+    let user_endpoint = format!("/users/{owner}/repos?per_page=100");
 
     let poll = db::get_poll_state(conn, &org_endpoint).await?;
+
+    // Repo lists change rarely. Skip the API call if polled in the last 24 hours.
+    if let Some(ref ts) = poll.last_polled_at {
+        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(ts) {
+            if chrono::Utc::now().signed_duration_since(last) < chrono::Duration::hours(24) {
+                tracing::debug!(owner, "org repo list polled <24h ago, using DB cache");
+                return repos_from_db(conn, owner).await;
+            }
+        }
+    }
 
     let body = if poll.etag.as_deref() == Some(NOT_ORG) {
         let poll2 = db::get_poll_state(conn, &user_endpoint).await?;
