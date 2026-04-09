@@ -96,13 +96,16 @@ enum Cmd {
     },
     /// Continuous polling loop (event-targeted after first pass)
     #[command(long_about = "Continuous polling loop.\n\n\
-        First iteration: full sweep (same as `ghcache sync`).\n\
-        Subsequent iterations: event-targeted -- only PRs mentioned in GitHub event payloads \
-        are re-fetched via GraphQL. Most polls are free 304 Not Modified responses.\n\n\
+        On startup, skips the full sweep if the DB already has PR data (cached from a \
+        previous run). Use --full-sweep to force a complete re-fetch.\n\n\
+        Each iteration is event-targeted: only PRs mentioned in GitHub event payloads \
+        are re-fetched via GraphQL. Full-sweep PR queries are batched (up to 20 repos \
+        per GraphQL call) to minimize API consumption. Most polls are free 304 responses.\n\n\
         Repos with checkout_on_sync = true in config have their sync_branches checked out \
         into staging_folder after each pass.\n\n\
         Also starts the HTTP command server on 127.0.0.1:{cmd_port} (default 7748).\n\
         Endpoints: GET /events (SSE), POST /subscribe, POST /heartbeat, POST /pause, POST /resume.\n\n\
+        --full-sweep: force a full PR re-fetch on startup even if data is cached.\n\
         --no-sync: start the HTTP server only; skip the sync loop entirely.\n\
         --daemon: double-fork to background, redirect stdio to /dev/null. \
         A pidfile is written next to the database (gh.pid) and checked on startup \

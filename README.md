@@ -248,23 +248,29 @@ and prints next steps. Falls back to `./ghcache.toml` if `dirs::config_dir()` is
 
 ### `ghcache sync [--repo owner/name] [--prs] [--notifications] [--events]`
 Full sweep sync: fetches all open PRs, events, notifications, and branches for every configured repo.
+PR queries are batched (up to 20 repos per GraphQL call) to minimize API consumption.
 
 - `--repo owner/name` restricts to one repo
 - `--prs / --notifications / --events` restrict to one data type
 - Always performs a full GraphQL PR fetch (not event-targeted)
 
-### `ghcache watch [--no-sync]`
-Continuous polling loop. First iteration is a full sweep; subsequent iterations are event-targeted
-(only PRs mentioned in PullRequestEvent / PullRequestReviewEvent payloads are re-fetched via GraphQL).
+### `ghcache watch [--no-sync] [--full-sweep]`
+Continuous polling loop. On startup, skips the full sweep if the DB already has PR data from a
+previous run. Subsequent iterations are event-targeted (only PRs mentioned in PullRequestEvent /
+PullRequestReviewEvent payloads are re-fetched via GraphQL). Most polls are free 304 responses.
+
+Org repo discovery is cached for 24 hours between API calls.
+
+- `--full-sweep` forces a complete PR re-fetch on startup even if data is cached
+- `--no-sync` starts the HTTP server only, with no sync loop
+- `--daemon` double-forks to background and redirects stdio to `/dev/null`
 
 Runs `checkout` for repos with `checkout_on_sync = true` after each sync pass.
 
-Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below). Pass `--no-sync` to run
-the HTTP server only, with no sync loop.
+Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below).
 
-`--daemon` double-forks to background and redirects stdio to `/dev/null`. A pidfile is written
-next to the database (`gh.pid`) on every `watch` start -- daemon or not -- and checked to prevent
-duplicate instances. A stale pidfile (dead process) is silently overwritten.
+A pidfile is written next to the database (`gh.pid`) on every `watch` start -- daemon or not --
+and checked to prevent duplicate instances. A stale pidfile (dead process) is silently overwritten.
 
 ### `ghcache checkout <owner/name> <branch>`
 Clone or update a single branch into `staging_folder`.
