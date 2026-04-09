@@ -144,10 +144,18 @@ fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if local.exists() {
         return Ok(local);
     }
+    // XDG conventional path (what most CLI tools on macOS/Linux use)
+    let xdg = dirs::home_dir().map(|h| h.join(".config").join("ghcache").join("config.toml"));
+    if let Some(ref p) = xdg {
+        if p.exists() {
+            return Ok(p.clone());
+        }
+    }
+    // Platform config dir (~/Library/Application Support on macOS)
     if let Some(cfg) = dirs::config_dir() {
-        let global = cfg.join("ghcache").join("config.toml");
-        if global.exists() {
-            return Ok(global);
+        let platform = cfg.join("ghcache").join("config.toml");
+        if platform.exists() {
+            return Ok(platform);
         }
     }
     bail!("no config found; searched $GHCACHE_CONFIG, ./ghcache.toml, ~/.config/ghcache/config.toml");
