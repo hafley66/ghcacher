@@ -108,6 +108,7 @@ fn org_to_repos(org: &OrgConfig, names: Vec<String>) -> Vec<RepoConfig> {
             sync_branches:        org.sync_branches.clone(),
             checkout_on_sync:     org.checkout_on_sync,
             poll_interval_seconds: org.poll_interval_seconds,
+            fs_alias:             org.fs_alias.clone(),
         })
         .collect()
 }
@@ -272,6 +273,7 @@ pub async fn watch(
                         sync_branches:         None,
                         checkout_on_sync:      None,
                         poll_interval_seconds: None,
+                        fs_alias:              None,
                     })
                     .collect();
 
@@ -305,9 +307,10 @@ pub async fn watch(
                 for b in r.sync_branches.as_deref().unwrap_or(&[]) {
                     tasks.push(checkout::CheckoutTask {
                         repo_id,
-                        owner:  r.owner.clone(),
-                        name:   r.name.clone(),
-                        branch: b.clone(),
+                        owner:    r.owner.clone(),
+                        name:     r.name.clone(),
+                        branch:   b.clone(),
+                        fs_owner: r.fs_owner().to_owned(),
                     });
                 }
             }
@@ -324,9 +327,10 @@ pub async fn watch(
                     for branch in org.sync_branches.as_deref().unwrap_or(&[]) {
                         tasks.push(checkout::CheckoutTask {
                             repo_id,
-                            owner:  org.owner.clone(),
-                            name:   name.clone(),
-                            branch: branch.clone(),
+                            owner:    org.owner.clone(),
+                            name:     name.clone(),
+                            branch:   branch.clone(),
+                            fs_owner: org.fs_owner().to_owned(),
                         });
                     }
                 }
@@ -380,8 +384,10 @@ mod tests {
                 sync_branches:        None,
                 checkout_on_sync:     None,
                 poll_interval_seconds: None,
+                fs_alias:             None,
             }],
             orgs: vec![],
+            owner_fs_aliases: std::collections::HashMap::new(),
         }
     }
 
@@ -480,8 +486,10 @@ mod integration {
                 sync_branches:        Some(vec!["main".into()]),
                 checkout_on_sync:     None,
                 poll_interval_seconds: None,
+                fs_alias:             None,
             }],
             orgs: vec![],
+            owner_fs_aliases: std::collections::HashMap::new(),
         }
     }
 

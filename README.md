@@ -154,6 +154,7 @@ sync_notifications   = false             # sync the authenticated user's persona
 # Discovered at sync time via the GitHub repos API (ETag-gated, usually a free 304).
 [[org]]
 owner                = "myorg"
+fs_alias             = "mo"              # optional: short name for staging_folder path
 sync_prs             = true
 sync_notifications   = true
 sync_events          = true
@@ -174,6 +175,24 @@ sync_branches        = ["main", "staging", "release/*"]  # glob trailing * suppo
 checkout_on_sync     = false   # if true, watch loop runs checkout for sync_branches
 poll_interval_seconds = 30    # overrides global for this repo
 ```
+
+### `fs_alias` -- shorter checkout paths
+
+Both `[[org]]` and `[[repo]]` accept an optional `fs_alias` field. When set, the staging folder
+uses this value instead of `owner` for the directory name on disk:
+
+```toml
+[[org]]
+owner    = "my-extremely-long-organization-name"
+fs_alias = "melo"
+sync_prs = true
+```
+
+Without `fs_alias`: `{staging_folder}/my-extremely-long-organization-name/repo-name`
+With `fs_alias`:    `{staging_folder}/melo/repo-name`
+
+The alias only affects filesystem paths. API calls still use the real `owner` for GitHub requests.
+Repos discovered via `[[org]]` inherit the org's `fs_alias`.
 
 `[[org]]` and `[[repo]]` can coexist. Repos discovered via `[[org]]` that are also listed under `[[repo]]` will be synced twice (once with each config). Use `exclude` to avoid that.
 

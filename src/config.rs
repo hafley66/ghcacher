@@ -59,6 +59,8 @@ pub struct RepoConfig {
     pub sync_branches: Option<Vec<String>>,
     pub checkout_on_sync: Option<bool>,
     pub poll_interval_seconds: Option<u64>,
+    /// Short alias used as the owner directory name on disk instead of `owner`.
+    pub fs_alias: Option<String>,
 }
 
 /// Sync all repos under a GitHub user or org account.
@@ -75,6 +77,8 @@ pub struct OrgConfig {
     /// Repo names to skip (exact match)
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Short alias used as the owner directory name on disk instead of `owner`.
+    pub fs_alias: Option<String>,
 }
 
 impl RepoConfig {
@@ -82,10 +86,22 @@ impl RepoConfig {
         format!("{}/{}", self.owner, self.name)
     }
 
+    /// Directory name for this owner on disk (fs_alias if set, otherwise owner).
+    pub fn fs_owner(&self) -> &str {
+        self.fs_alias.as_deref().unwrap_or(&self.owner)
+    }
+
     pub fn poll_interval(&self, global: &Global) -> u64 {
         self.poll_interval_seconds
             .or(global.poll_interval_seconds)
             .unwrap_or(60)
+    }
+}
+
+impl OrgConfig {
+    /// Directory name for this owner on disk (fs_alias if set, otherwise owner).
+    pub fn fs_owner(&self) -> &str {
+        self.fs_alias.as_deref().unwrap_or(&self.owner)
     }
 }
 
@@ -104,6 +120,8 @@ pub struct ResolvedConfig {
     pub sync_notifications: bool,
     pub repos: Vec<RepoConfig>,
     pub orgs: Vec<OrgConfig>,
+    /// Maps GitHub owner name -> fs directory name (only entries with fs_alias set).
+    pub owner_fs_aliases: std::collections::HashMap<String, String>,
 }
 
 pub fn load(explicit_path: Option<&Path>) -> Result<ResolvedConfig> {
@@ -165,6 +183,18 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
             .with_context(|| format!("creating staging_folder {}", staging_folder.display()))?;
     }
 
+    let mut owner_fs_aliases = std::collections::HashMap::new();
+    for r in &config.repos {
+        if let Some(alias) = &r.fs_alias {
+            owner_fs_aliases.insert(r.owner.clone(), alias.clone());
+        }
+    }
+    for o in &config.orgs {
+        if let Some(alias) = &o.fs_alias {
+            owner_fs_aliases.insert(o.owner.clone(), alias.clone());
+        }
+    }
+
     Ok(ResolvedConfig {
         db_path,
         staging_folder,
@@ -178,6 +208,7 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         sync_notifications: config.global.sync_notifications.unwrap_or(false),
         repos: config.repos,
         orgs: config.orgs,
+        owner_fs_aliases,
     })
 }
 
@@ -280,6 +311,7 @@ name = "backend"
             sync_branches: None,
             checkout_on_sync: None,
             poll_interval_seconds: None,
+            fs_alias: None,
         };
         assert_eq!(r.slug(), "myorg/backend");
     }
@@ -300,6 +332,7 @@ name = "backend"
             sync_branches: None,
             checkout_on_sync: None,
             poll_interval_seconds: None,
+            fs_alias: None,
         };
         assert_eq!(r.poll_interval(&global), 120);
     }
@@ -320,6 +353,7 @@ name = "backend"
             sync_branches: None,
             checkout_on_sync: None,
             poll_interval_seconds: Some(30),
+            fs_alias: None,
         };
         assert_eq!(r.poll_interval(&global), 30);
     }

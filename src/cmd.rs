@@ -231,6 +231,7 @@ pub async fn run(
     pool: SqlitePool,
     port: u16,
     paused: Arc<AtomicBool>,
+    owner_fs_aliases: Arc<HashMap<String, String>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
         .await
@@ -258,8 +259,9 @@ pub async fn run(
         let clients = Arc::clone(&clients);
         let staging = staging.clone();
         let paused = Arc::clone(&paused);
+        let aliases = Arc::clone(&owner_fs_aliases);
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, &subs, &staging, clients, paused).await {
+            if let Err(e) = handle(stream, &subs, &staging, clients, paused, &aliases).await {
                 tracing::warn!(error = %e, "cmd: request failed");
             }
         });
@@ -309,6 +311,7 @@ async fn handle(
     staging: &Path,
     clients: Clients,
     paused: Arc<AtomicBool>,
+    owner_fs_aliases: &HashMap<String, String>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -335,7 +338,8 @@ async fn handle(
         }
         ("POST", "/subscribe") => {
             let req: SubscribeReq = serde_json::from_slice(&body)?;
-            let repo_path = ensure_repo(staging, &req.owner, &req.repo).await?;
+            let fs_owner = owner_fs_aliases.get(&req.owner).map(|s| s.as_str()).unwrap_or(&req.owner);
+            let repo_path = ensure_repo(staging, &req.owner, &req.repo, fs_owner).await?;
             subs.upsert(req.uuid, req.owner, req.repo, req.pr_sync, req.notifications);
             respond_200(&mut writer, &serde_json::json!({"path": repo_path}).to_string()).await
         }
@@ -369,9 +373,10 @@ async fn respond_200(writer: &mut tokio::net::tcp::OwnedWriteHalf, body: &str) -
     Ok(())
 }
 
-/// Clone repo to `{staging}/{owner}/{repo}` if absent, then `git fetch --all`.
-async fn ensure_repo(staging: &Path, owner: &str, repo: &str) -> Result<PathBuf> {
-    let dest = staging.join(owner).join(repo);
+/// Clone repo to `{staging}/{fs_owner}/{repo}` if absent, then `git fetch --all`.
+/// `fs_owner` may differ from `owner` when an fs_alias is configured.
+async fn ensure_repo(staging: &Path, owner: &str, repo: &str, fs_owner: &str) -> Result<PathBuf> {
+    let dest = staging.join(fs_owner).join(repo);
     if !dest.exists() {
         tokio::fs::create_dir_all(dest.parent().unwrap()).await?;
         let slug = format!("{owner}/{repo}");

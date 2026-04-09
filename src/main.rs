@@ -204,8 +204,9 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
                 let pool_cmd = pool.clone();
                 let port = cfg.cmd_port;
                 let paused_server = Arc::clone(&paused);
+                let aliases = Arc::new(cfg.owner_fs_aliases.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = cmd::run(subs_server, staging, pool_cmd, port, paused_server).await {
+                    if let Err(e) = cmd::run(subs_server, staging, pool_cmd, port, paused_server, aliases).await {
                         tracing::error!(error = %e, "cmd server exited");
                     }
                 });
@@ -224,7 +225,8 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
         Cmd::Checkout { repo, branch } => {
             let pool = db::open(&cfg.db_path).await?;
             let (owner, name) = checkout::parse_slug(&repo)?;
-            checkout::checkout_one(&pool, &cfg.staging_folder, &owner, &name, &branch).await
+            let fs_owner = cfg.owner_fs_aliases.get(&owner).map(|s| s.as_str());
+            checkout::checkout_one(&pool, &cfg.staging_folder, &owner, &name, &branch, fs_owner).await
         }
     }
 }

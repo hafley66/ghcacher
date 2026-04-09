@@ -8,6 +8,8 @@ pub struct CheckoutTask {
     pub owner: String,
     pub name: String,
     pub branch: String,
+    /// Directory name for owner on disk (may differ from `owner` when fs_alias is set).
+    pub fs_owner: String,
 }
 
 enum Op {
@@ -32,6 +34,7 @@ pub async fn checkout_one(
     owner: &str,
     name: &str,
     branch: &str,
+    fs_owner: Option<&str>,
 ) -> Result<()> {
     let mut conn = pool.acquire().await?;
     let repo_id = crate::db::get_repo_id(&mut *conn, owner, name).await?
@@ -42,6 +45,7 @@ pub async fn checkout_one(
         owner: owner.into(),
         name: name.into(),
         branch: branch.into(),
+        fs_owner: fs_owner.unwrap_or(owner).into(),
     }]).await
 }
 
@@ -84,7 +88,7 @@ pub async fn checkout_all(
         .collect();
 
     let items: Vec<WorkItem> = tasks.iter().map(|t| {
-        let local_path = staging.join(&t.owner).join(&t.name);
+        let local_path = staging.join(&t.fs_owner).join(&t.name);
         let (new_sha, stored_sha) = sha_map
             .get(&(t.repo_id, t.branch.clone()))
             .cloned()
