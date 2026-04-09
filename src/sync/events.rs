@@ -101,12 +101,15 @@ fn sha_from_ci_event<'a>(ev_type: &str, payload: &'a serde_json::Value) -> Optio
 }
 
 /// Sync all events for a GitHub org in one call. Returns repo name → dirty PR numbers.
+/// Uses `/users/{username}/events/orgs/{owner}` which includes private repo events,
+/// unlike `/orgs/{owner}/events` which only returns public events.
 pub async fn sync_org(
     conn: &mut SqliteConnection,
     gh: &dyn GitHubClient,
     owner: &str,
+    username: &str,
 ) -> Result<HashMap<String, Vec<i64>>> {
-    let endpoint = format!("/orgs/{owner}/events");
+    let endpoint = format!("/users/{username}/events/orgs/{owner}");
     let poll = db::get_poll_state(conn, &endpoint).await?;
 
     if let (Some(interval), Some(ref last_polled)) = (poll.poll_interval, &poll.last_polled_at) {

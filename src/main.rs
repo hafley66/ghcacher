@@ -194,8 +194,9 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
         Cmd::Sync { repo, prs, notifications, events } => {
             let pool = db::open(&cfg.db_path).await?;
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold, cli.silent, cli.calls_to_stdout);
+            let username = gh::authenticated_username(&cfg.gh_binary).await?;
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
-            sync::run(&pool, &gh, &cfg, filter, true, &[], &[]).await
+            sync::run(&pool, &gh, &cfg, filter, true, &[], &[], &username).await
         }
         Cmd::Watch { daemon: _, no_sync, full_sweep } => {
             let pid_path = cfg.db_path.with_extension("pid");

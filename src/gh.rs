@@ -464,6 +464,23 @@ impl GitHubClient for MockGhClient {
     }
 }
 
+/// Fetch the authenticated GitHub username via `gh api /user`.
+pub async fn authenticated_username(binary: &str) -> Result<String> {
+    let output = Command::new(binary)
+        .args(["api", "/user", "--jq", ".login"])
+        .output()
+        .await
+        .context("fetching authenticated user")?;
+    if !output.status.success() {
+        bail!("gh api /user failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let login = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if login.is_empty() {
+        bail!("gh api /user returned empty login");
+    }
+    Ok(login)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

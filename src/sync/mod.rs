@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::checkout;
 use crate::config::{OrgConfig, RepoConfig, ResolvedConfig};
 use crate::db;
-use crate::gh::{GhRequest, GitHubClient};
+use crate::gh::{self, GhRequest, GitHubClient};
 
 pub struct SyncFilter {
     pub repo:        Option<String>,
@@ -131,6 +131,7 @@ pub async fn run(
     full_sweep: bool,
     extra_repos: &[RepoConfig],
     extra_notif_slugs: &[(String, String)],
+    gh_username: &str,
 ) -> Result<()> {
     let mut org_repos: Vec<RepoConfig> = vec![];
     let mut org_owners: HashSet<String> = HashSet::new();
@@ -152,7 +153,7 @@ pub async fn run(
         let mut conn = pool.acquire().await?;
         for org in &cfg.orgs {
             if org.sync_events.unwrap_or(false) {
-                match events::sync_org(&mut *conn, gh, &org.owner).await {
+                match events::sync_org(&mut *conn, gh, &org.owner, gh_username).await {
                     Ok(dirty) => {
                         for (name, prs) in dirty {
                             org_dirty.insert((org.owner.clone(), name), prs);
@@ -277,6 +278,7 @@ pub async fn watch(
     force_full_sweep: bool,
 ) -> Result<()> {
     tracing::info!("starting watch loop");
+    let gh_username = gh::authenticated_username(&cfg.gh_binary).await?;
     let mut first_run = if force_full_sweep {
         true
     } else {
@@ -341,7 +343,7 @@ pub async fn watch(
             tracing::debug!(count = extra_repos.len(), "syncing subscription repos");
         }
 
-        if let Err(e) = run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs).await {
+        if let Err(e) = run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs, &gh_username).await {
             tracing::error!(error = %e, "watch sync error");
         }
         first_run = false;
@@ -453,7 +455,7 @@ mod tests {
         mock.push_rest(serde_json::json!([])); // events
         mock.push_graphql(serde_json::json!({"repo_0": {"pullRequests": {"nodes": []}}}));
 
-        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), true, &[], &[]).await.unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), true, &[], &[], "testuser").await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 1);
         let (endpoint, _) = &mock.graphql_calls.lock().unwrap()[0];
@@ -487,7 +489,7 @@ mod tests {
             fs_alias: None,
         });
 
-        run(&pool, &mock, &cfg, all_filter(), true, &[], &[]).await.unwrap();
+        run(&pool, &mock, &cfg, all_filter(), true, &[], &[], "testuser").await.unwrap();
 
         // Both repos should be packed into a single GraphQL call
         assert_eq!(mock.graphql_call_count(), 1, "expected 1 batched GraphQL call, got {}", mock.graphql_call_count());
@@ -499,7 +501,7 @@ mod tests {
         let mock = MockGhClient::new();
         mock.push_rest_304();
 
-        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).await.unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[], "testuser").await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 0);
     }
@@ -517,7 +519,7 @@ mod tests {
         ]));
         mock.push_graphql(serde_json::json!({"repository": {}}));
 
-        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).await.unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[], "testuser").await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 1, "expected exactly 1 batched graphql call");
         let (endpoint, query) = &mock.graphql_calls.lock().unwrap()[0];
@@ -535,7 +537,7 @@ mod tests {
              "payload": {"ref": "refs/heads/main"}, "created_at": "2026-01-01T00:00:00Z"},
         ]));
 
-        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[]).await.unwrap();
+        run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[], "testuser").await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 0);
     }
@@ -589,7 +591,7 @@ mod integration {
         let pool = db::open(&cfg.db_path).await.unwrap();
         let gh   = GhClient::new("gh", 500, 50, true, false);
 
-        run(&pool, &gh, &cfg, all_filter(), true, &[], &[]).await.unwrap();
+        run(&pool, &gh, &cfg, all_filter(), true, &[], &[], "testuser").await.unwrap();
 
         let repo_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM repo WHERE owner='hafley66' AND name='cc-hud'",
@@ -627,7 +629,7 @@ mod integration {
             .fetch_one(&pool).await.unwrap();
         assert!(change_rows > 0);
 
-        run(&pool, &gh, &cfg, all_filter(), false, &[], &[]).await.unwrap();
+        run(&pool, &gh, &cfg, all_filter(), false, &[], &[], "testuser").await.unwrap();
 
         let cache_hits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_log WHERE cache_hit=1")
             .fetch_one(&pool).await.unwrap();
