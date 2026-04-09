@@ -256,8 +256,9 @@ PR queries are batched (up to 20 repos per GraphQL call) to minimize API consump
 
 ### `ghcache watch [--no-sync] [--full-sweep]`
 Continuous polling loop. On startup, skips the full sweep if the DB already has PR data from a
-previous run. Subsequent iterations are event-targeted (only PRs mentioned in PullRequestEvent /
-PullRequestReviewEvent payloads are re-fetched via GraphQL). Most polls are free 304 responses.
+previous run. Subsequent iterations are event-targeted: org repos with no new events since the
+last pass are skipped entirely (no API calls, no transaction). Only repos with activity get
+their PRs and branches re-fetched. Most polls are free 304 responses.
 
 Org repo discovery is cached for 24 hours between API calls.
 
@@ -281,9 +282,11 @@ Examples:
 - `myorg/backend` branch `main`  → `~/src/staging/myorg/backend`
 - `myorg/backend` branch `staging` → `~/src/staging/myorg/backend` (same dir, different branch reset)
 
-First checkout: `gh repo clone owner/name dest -- --branch branch` (full history).
+First checkout: `gh repo clone owner/name dest` (full history, default branch).
+The clone does not pass `--branch`, so repos with any default branch name work.
 Subsequent checkouts: `git fetch origin branch && git reset --hard FETCH_HEAD`
 (only runs if `branch.sha` in the DB differs from the last recorded checkout sha).
+If the requested branch does not exist on the remote, the fetch is skipped with a warning.
 
 Requires `staging_folder` in config. Requires the repo to exist in the DB (run `ghcache sync` first).
 
