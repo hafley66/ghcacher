@@ -78,6 +78,10 @@ pub async fn sync(
 
             if let Some(pr_num) = pr_number_from_event(ev_type, payload) {
                 dirty_prs.push(pr_num);
+            } else if ev_type == "PushEvent" {
+                if let Some(branch) = payload["ref"].as_str().and_then(|r| r.strip_prefix("refs/heads/")) {
+                    dirty_prs.extend(pr_numbers_from_branch(conn, repo_id, branch).await);
+                }
             } else if let Some(sha) = sha_from_ci_event(ev_type, payload) {
                 if let Some(pr_num) = pr_number_from_sha(conn, repo_id, sha).await {
                     dirty_prs.push(pr_num);
@@ -195,6 +199,11 @@ pub async fn sync_org(
                 dirty.entry(repo_name.to_string()).or_default();
                 if let Some(pr_num) = pr_number_from_event(ev_type, payload) {
                     dirty.entry(repo_name.to_string()).or_default().push(pr_num);
+                } else if ev_type == "PushEvent" {
+                    if let Some(branch) = payload["ref"].as_str().and_then(|r| r.strip_prefix("refs/heads/")) {
+                        let prs = pr_numbers_from_branch(conn, repo_id, branch).await;
+                        dirty.entry(repo_name.to_string()).or_default().extend(prs);
+                    }
                 } else if let Some(sha) = sha_from_ci_event(ev_type, payload) {
                     if let Some(pr_num) = pr_number_from_sha(conn, repo_id, sha).await {
                         dirty.entry(repo_name.to_string()).or_default().push(pr_num);
@@ -229,6 +238,18 @@ async fn pr_number_from_sha(conn: &mut SqliteConnection, repo_id: i64, sha: &str
     .await
     .ok()
     .flatten()
+}
+
+/// PushEvent carries a branch ref. Look up any open PRs with that head_ref.
+async fn pr_numbers_from_branch(conn: &mut SqliteConnection, repo_id: i64, branch: &str) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT number FROM pull_request WHERE repo_id = ? AND head_ref = ? AND state = 'open'",
+    )
+    .bind(repo_id)
+    .bind(branch)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -342,6 +363,31 @@ mod tests {
         assert_eq!(sha_from_ci_event("CheckSuiteEvent", &payload), Some("def456"));
 
         assert_eq!(sha_from_ci_event("PushEvent", &serde_json::json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn push_event_triggers_pr_resync_via_branch() {
+        use super::*;
+
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO pull_request
+             (repo_id, number, state, title, head_sha, head_ref, base_ref, draft, created_at, updated_at)
+             VALUES (?, 55, 'open', 'Feature PR', 'abc', 'feature-x', 'main', 0, '2026-01-01', '2026-01-01')",
+        )
+        .bind(repo_id)
+        .execute(&mut *c)
+        .await
+        .unwrap();
+
+        let prs = pr_numbers_from_branch(&mut *c, repo_id, "feature-x").await;
+        assert_eq!(prs, vec![55]);
+
+        let prs = pr_numbers_from_branch(&mut *c, repo_id, "main").await;
+        assert_eq!(prs, vec![] as Vec<i64>);
     }
 
     #[tokio::test]
