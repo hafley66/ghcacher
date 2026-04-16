@@ -101,10 +101,10 @@ enum Cmd {
         Each iteration is event-targeted: only PRs mentioned in GitHub event payloads \
         are re-fetched via GraphQL. Full-sweep PR queries are batched (up to 20 repos \
         per GraphQL call) to minimize API consumption. Most polls are free 304 responses.\n\n\
-        Repos with checkout_on_sync = true in config have their sync_branches checked out \
-        into staging_folder after each pass. With checkout_pr_branches = true, the head_ref \
-        of every open PR is also fetched into the same local clone (fork PRs whose branch \
-        isn't on origin are skipped with a warn).\n\n\
+        Repos with checkout_on_sync or checkout_pr_branches = true get a single `git fetch \
+        origin` per cycle, but only when that repo had activity (any event this pass). If the \
+        local clone is missing, gh repo clone runs once. HEAD is never touched -- use `ghcache \
+        checkout` for an explicit reset.\n\n\
         Also starts the HTTP command server on 127.0.0.1:{cmd_port} (default 7748).\n\
         Endpoints: GET /events (SSE), POST /subscribe, POST /heartbeat, POST /pause, POST /resume.\n\n\
         --full-sweep: force a full PR re-fetch on startup even if data is cached.\n\
@@ -128,16 +128,14 @@ enum Cmd {
         #[command(subcommand)]
         sub: query::QueryCmd,
     },
-    /// Clone or update a branch into staging_folder
-    #[command(long_about = "Clone or update a branch into staging_folder.\n\n\
+    /// Clone or update a repo and reset HEAD to a branch
+    #[command(long_about = "Clone or update a repo, then hard-reset HEAD to `branch`.\n\n\
         Path convention: {staging_folder}/{owner}/{name}\n\
-        Example: myorg/backend branch main  ->  ~/src/staging/myorg/backend\n\n\
-        First checkout: gh repo clone owner/name dest -- --branch branch\n\
-        Subsequent:     git fetch origin branch && git reset --hard FETCH_HEAD\n\
-        (skipped if branch.sha in DB matches last recorded checkout sha)\n\n\
+        Example: myorg/backend main  ->  ~/src/staging/myorg/backend\n\n\
+        First checkout: gh repo clone owner/name dest\n\
+        Subsequent:     git fetch origin && git reset --hard origin/branch\n\n\
         Requires staging_folder in config and the repo to exist in the DB (run sync first).\n\
-        watch runs this automatically for repos with checkout_on_sync = true (and for every \
-        open PR's head_ref when checkout_pr_branches = true).")]
+        Unlike the watch loop (which only fetches), this command always resets HEAD.")]
     Checkout {
         /// owner/name
         repo: String,
@@ -199,7 +197,7 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
             let gh = gh::GhClient::new(&cfg.gh_binary, cfg.rate_warn_threshold, cfg.rate_stop_threshold, cli.silent, cli.calls_to_stdout);
             let username = gh::authenticated_username(&cfg.gh_binary).await?;
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
-            sync::run(&pool, &gh, &cfg, filter, true, &[], &[], &username).await
+            sync::run(&pool, &gh, &cfg, filter, true, &[], &[], &username).await.map(|_| ())
         }
         Cmd::Watch { daemon: _, no_sync, full_sweep } => {
             let pid_path = cfg.db_path.with_extension("pid");

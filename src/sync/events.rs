@@ -5,14 +5,21 @@ use std::collections::HashMap;
 use crate::db::{self, ChangeEvent};
 use crate::gh::{GitHubClient, GhRequest};
 
-/// Sync repo events. Returns PR numbers touched by PullRequestEvent/PullRequestReviewEvent.
+pub struct EventsResult {
+    /// Any event row inserted this pass -- used as a dirty signal for fetch.
+    pub had_activity: bool,
+    /// PR numbers touched by events this pass -- drives targeted PR re-sync.
+    pub dirty_prs: Vec<i64>,
+}
+
+/// Sync repo events. Returns activity flag + PR numbers touched.
 pub async fn sync(
     conn: &mut SqliteConnection,
     gh: &dyn GitHubClient,
     repo_id: i64,
     owner: &str,
     name: &str,
-) -> Result<Vec<i64>> {
+) -> Result<EventsResult> {
     let endpoint = format!("/repos/{owner}/{name}/events");
     let poll = db::get_poll_state(conn, &endpoint).await?;
 
@@ -21,7 +28,7 @@ pub async fn sync(
             let elapsed = chrono::Utc::now().signed_duration_since(last).num_seconds();
             if elapsed < interval {
                 tracing::debug!(repo = %format!("{owner}/{name}"), elapsed, interval, "events: skipping, poll interval not elapsed");
-                return Ok(vec![]);
+                return Ok(EventsResult { had_activity: false, dirty_prs: vec![] });
             }
         }
     }
@@ -35,12 +42,12 @@ pub async fn sync(
 
     if resp.is_not_modified() {
         tracing::debug!(repo = %format!("{owner}/{name}"), "events: 304 not modified");
-        return Ok(vec![]);
+        return Ok(EventsResult { had_activity: false, dirty_prs: vec![] });
     }
 
     let events = match resp.body.as_array() {
         Some(a) => a,
-        None => return Ok(vec![]),
+        None => return Ok(EventsResult { had_activity: false, dirty_prs: vec![] }),
     };
 
     let slug = format!("{owner}/{name}");
@@ -92,7 +99,7 @@ pub async fn sync(
     }
 
     tracing::info!(repo = %slug, inserted, total = events.len(), dirty_prs = dirty_prs.len(), "events synced");
-    Ok(dirty_prs)
+    Ok(EventsResult { had_activity: inserted > 0, dirty_prs })
 }
 
 fn sha_from_ci_event<'a>(ev_type: &str, payload: &'a serde_json::Value) -> Option<&'a str> {

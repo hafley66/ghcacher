@@ -1,33 +1,19 @@
 use anyhow::{anyhow, bail, Context, Result};
-use sqlx::{Row, SqlitePool};
-use std::path::{Path, PathBuf};
+use sqlx::SqlitePool;
+use std::path::Path;
 use tokio::process::Command;
 
 pub struct CheckoutTask {
-    pub repo_id: i64,
     pub owner: String,
     pub name: String,
-    pub branch: String,
     /// Directory name for owner on disk (may differ from `owner` when fs_alias is set).
     pub fs_owner: String,
+    /// Some activity was observed for this repo this cycle (dirty PR or branch push).
+    /// Absent the dir, a clone happens regardless; otherwise this gates the fetch.
+    pub is_dirty: bool,
 }
 
-enum Op {
-    Clone,
-    Fetch,
-    Skip,
-}
-
-struct WorkItem {
-    repo_id: i64,
-    owner: String,
-    name: String,
-    branch: String,
-    local_path: PathBuf,
-    new_sha: Option<String>,
-    op: Op,
-}
-
+/// CLI-driven explicit checkout: clone if missing, fetch, reset HEAD to `branch`.
 pub async fn checkout_one(
     pool: &SqlitePool,
     staging: &Path,
@@ -37,132 +23,55 @@ pub async fn checkout_one(
     fs_owner: Option<&str>,
 ) -> Result<()> {
     let mut conn = pool.acquire().await?;
-    let repo_id = crate::db::get_repo_id(&mut *conn, owner, name).await?
+    let _ = crate::db::get_repo_id(&mut *conn, owner, name).await?
         .ok_or_else(|| anyhow!("repo {owner}/{name} not in DB; run sync first"))?;
     drop(conn);
-    checkout_all(pool, staging, &[CheckoutTask {
-        repo_id,
-        owner: owner.into(),
-        name: name.into(),
-        branch: branch.into(),
-        fs_owner: fs_owner.unwrap_or(owner).into(),
-    }]).await
+
+    let fs_owner = fs_owner.unwrap_or(owner);
+    let local_path = staging.join(fs_owner).join(name);
+    let slug = format!("{owner}/{name}");
+
+    if !local_path.exists() {
+        run_clone(&slug, &local_path).await?;
+    } else {
+        run_fetch(&local_path).await?;
+    }
+    run_reset(&local_path, branch).await
 }
 
+/// Watch-driven fetch sweep: clone missing dirs, fetch origin for dirty repos,
+/// skip everything else. HEAD is never touched.
 pub async fn checkout_all(
-    pool: &SqlitePool,
     staging: &Path,
     tasks: &[CheckoutTask],
 ) -> Result<()> {
-    let unique_repo_ids: Vec<i64> = {
-        use std::collections::HashSet;
-        tasks.iter().map(|t| t.repo_id).collect::<HashSet<_>>().into_iter().collect()
-    };
-
-    if unique_repo_ids.is_empty() {
-        return Ok(());
+    let mut handles: Vec<tokio::task::JoinHandle<(String, Result<()>)>> = vec![];
+    for t in tasks {
+        let staging = staging.to_path_buf();
+        let owner = t.owner.clone();
+        let name = t.name.clone();
+        let fs_owner = t.fs_owner.clone();
+        let is_dirty = t.is_dirty;
+        let slug = format!("{owner}/{name}");
+        handles.push(tokio::spawn(async move {
+            let local_path = staging.join(&fs_owner).join(&name);
+            let res = if !local_path.exists() {
+                run_clone(&slug, &local_path).await
+            } else if is_dirty {
+                run_fetch(&local_path).await
+            } else {
+                tracing::debug!(%slug, "checkout: no new activity, skipping");
+                Ok(())
+            };
+            (slug, res)
+        }));
     }
-
-    let mut qb = sqlx::QueryBuilder::new(
-        "SELECT b.repo_id, b.name, b.sha, c.sha
-         FROM branch b
-         LEFT JOIN checkout c ON c.repo_id = b.repo_id AND c.branch = b.name
-         WHERE b.repo_id IN (",
-    );
-    let mut sep = qb.separated(", ");
-    for id in &unique_repo_ids {
-        sep.push_bind(*id);
-    }
-    sep.push_unseparated(")");
-
-    let rows = qb.build().fetch_all(pool).await?;
-    let sha_map: std::collections::HashMap<(i64, String), (Option<String>, Option<String>)> = rows
-        .iter()
-        .map(|row| {
-            let repo_id: i64 = row.get(0);
-            let branch: String = row.get(1);
-            let branch_sha: Option<String> = row.get(2);
-            let checkout_sha: Option<String> = row.get(3);
-            ((repo_id, branch), (branch_sha, checkout_sha))
-        })
-        .collect();
-
-    let items: Vec<WorkItem> = tasks.iter().map(|t| {
-        let local_path = staging.join(&t.fs_owner).join(&t.name);
-        let (new_sha, stored_sha) = sha_map
-            .get(&(t.repo_id, t.branch.clone()))
-            .cloned()
-            .unwrap_or((None, None));
-        let op = if new_sha.is_some() && new_sha == stored_sha {
-            Op::Skip
-        } else if local_path.exists() {
-            Op::Fetch
-        } else {
-            Op::Clone
-        };
-        WorkItem {
-            repo_id: t.repo_id,
-            owner: t.owner.clone(),
-            name: t.name.clone(),
-            branch: t.branch.clone(),
-            local_path,
-            new_sha,
-            op,
-        }
-    }).collect();
-
-    type TaskResult = Result<(i64, String, PathBuf, Option<String>)>;
-
-    let mut handles: Vec<tokio::task::JoinHandle<TaskResult>> = vec![];
-    for item in items {
-        let WorkItem { repo_id, owner, name, branch, local_path, new_sha, op } = item;
-        match op {
-            Op::Skip => {
-                tracing::debug!(path = %local_path.display(), "checkout: sha unchanged, skipping");
-            }
-            Op::Clone => {
-                let slug = format!("{owner}/{name}");
-                handles.push(tokio::spawn(async move {
-                    run_clone(&slug, &local_path).await?;
-                    Ok((repo_id, branch, local_path, new_sha))
-                }));
-            }
-            Op::Fetch => {
-                handles.push(tokio::spawn(async move {
-                    run_fetch(&local_path, &branch).await?;
-                    Ok((repo_id, branch, local_path, new_sha))
-                }));
-            }
+    for h in handles {
+        let (slug, res) = h.await.map_err(|_| anyhow!("checkout task panicked"))?;
+        if let Err(e) = res {
+            tracing::error!(%slug, error = %e, "checkout: repo failed");
         }
     }
-
-    for handle in handles {
-        match handle.await.map_err(|_| anyhow!("checkout task panicked"))? {
-            Ok((repo_id, branch, local_path, new_sha)) => {
-                let now = chrono::Utc::now().to_rfc3339();
-                sqlx::query(
-                    "INSERT INTO checkout (repo_id, branch, local_path, sha, checked_out_at)
-                     VALUES (?, ?, ?, ?, ?)
-                     ON CONFLICT(repo_id, branch) DO UPDATE SET
-                         local_path     = excluded.local_path,
-                         sha            = excluded.sha,
-                         checked_out_at = excluded.checked_out_at",
-                )
-                .bind(repo_id)
-                .bind(&branch)
-                .bind(local_path.to_string_lossy().as_ref())
-                .bind(&new_sha)
-                .bind(&now)
-                .execute(pool)
-                .await?;
-                tracing::info!(path = %local_path.display(), "checkout: done");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "checkout: git op failed");
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -172,8 +81,6 @@ async fn run_clone(slug: &str, dest: &Path) -> Result<()> {
             .await
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    // Clone without --branch so it gets whatever the repo's default branch is.
-    // Repos in an org may use "main", "master", or something else entirely.
     let status = Command::new("gh")
         .args(["repo", "clone", slug, &dest.to_string_lossy()])
         .status()
@@ -186,29 +93,32 @@ async fn run_clone(slug: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_fetch(path: &Path, branch: &str) -> Result<()> {
+async fn run_fetch(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy();
-
-    let fetch = Command::new("git")
-        .args(["-C", &path_str, "fetch", "origin", branch])
+    let status = Command::new("git")
+        .args(["-C", &path_str, "fetch", "origin"])
         .status()
         .await
         .context("git fetch")?;
-    if !fetch.success() {
-        tracing::warn!(path = %path.display(), %branch, "branch not found on remote, skipping");
-        return Ok(());
+    if !status.success() {
+        bail!("git fetch failed in {}", path.display());
     }
+    tracing::info!(path = %path.display(), "fetched origin");
+    Ok(())
+}
 
-    let reset = Command::new("git")
-        .args(["-C", &path_str, "reset", "--hard", "FETCH_HEAD"])
+async fn run_reset(path: &Path, branch: &str) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    let remote_ref = format!("origin/{branch}");
+    let status = Command::new("git")
+        .args(["-C", &path_str, "reset", "--hard", &remote_ref])
         .status()
         .await
         .context("git reset --hard")?;
-    if !reset.success() {
-        bail!("git reset --hard failed in {}", path.display());
+    if !status.success() {
+        bail!("git reset --hard {remote_ref} failed in {}", path.display());
     }
-
-    tracing::info!(path = %path.display(), %branch, "fetched and reset");
+    tracing::info!(path = %path.display(), %branch, "reset --hard to remote");
     Ok(())
 }
 

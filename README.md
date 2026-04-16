@@ -159,8 +159,8 @@ sync_prs             = true
 sync_notifications   = true
 sync_events          = true
 sync_branches        = ["main"]
-checkout_on_sync     = false
-checkout_pr_branches = false             # also fetch every open PR's head_ref
+checkout_on_sync     = false             # run `git fetch origin` on this repo when activity lands
+checkout_pr_branches = false             # same trigger, broader scope: PR head events also count as activity
 exclude              = ["archived-repo", "scratch"]   # repo names to skip
 
 # Or target specific repos explicitly.
@@ -172,9 +172,8 @@ sync_prs             = true
 sync_notifications   = true
 sync_events          = true
 sync_branches        = ["main", "staging", "release/*"]  # glob trailing * supported
-checkout_on_sync     = false   # if true, watch loop runs checkout for sync_branches
-checkout_pr_branches = false   # if true, also fetch every open PR's head_ref (fork PRs whose
-                               # branch isn't on origin are skipped with a warn)
+checkout_on_sync     = false   # if true, watch fetches origin once per cycle when any event lands
+checkout_pr_branches = false   # same trigger; kept separate so you can opt in per-scope
 ```
 
 ### `fs_alias` -- shorter checkout paths
@@ -267,10 +266,11 @@ Org repo discovery is cached for 24 hours between API calls.
 - `--no-sync` starts the HTTP server only, with no sync loop
 - `--daemon` double-forks to background and redirects stdio to `/dev/null`
 
-Runs `checkout` for repos with `checkout_on_sync = true` after each sync pass. If
-`checkout_pr_branches = true`, the watch loop also fetches every open PR's head_ref
-into the same local clone (driven by PushEvent → PR re-sync, so feature branches
-stay current without polling all branches).
+For repos with `checkout_on_sync = true` or `checkout_pr_branches = true`: if the local clone
+is missing, `gh repo clone` runs once. Otherwise the watch loop runs `git fetch origin` once
+per repo per cycle, but only when that repo had activity this cycle (any PushEvent,
+PullRequestEvent, or other /events row). HEAD is never touched -- the local working tree is
+left alone. Use `ghcache checkout <repo> <branch>` for an explicit reset.
 
 Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below).
 
