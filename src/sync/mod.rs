@@ -104,6 +104,19 @@ async fn repos_from_db(conn: &mut sqlx::SqliteConnection, owner: &str) -> Result
     Ok(names)
 }
 
+/// Distinct head_ref values for open PRs on this repo. Fork PR head refs may
+/// not exist on origin -- run_fetch will warn and skip those.
+async fn pr_head_refs(conn: &mut sqlx::SqliteConnection, repo_id: i64) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT head_ref FROM pull_request
+         WHERE repo_id = ? AND state = 'open' AND head_ref IS NOT NULL AND head_ref <> ''",
+    )
+    .bind(repo_id)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap_or_default()
+}
+
 fn org_to_repos(org: &OrgConfig, names: Vec<String>) -> Vec<RepoConfig> {
     names
         .into_iter()
@@ -117,7 +130,7 @@ fn org_to_repos(org: &OrgConfig, names: Vec<String>) -> Vec<RepoConfig> {
             sync_events:          org.sync_events,
             sync_branches:        org.sync_branches.clone(),
             checkout_on_sync:     org.checkout_on_sync,
-            poll_interval_seconds: org.poll_interval_seconds,
+            checkout_pr_branches: org.checkout_pr_branches,
             fs_alias:             org.fs_alias.clone(),
         })
         .collect()
@@ -325,7 +338,7 @@ pub async fn watch(
                         sync_events:           None,
                         sync_branches:         None,
                         checkout_on_sync:      None,
-                        poll_interval_seconds: None,
+                        checkout_pr_branches:  None,
                         fs_alias:              None,
                     })
                     .collect();
@@ -352,23 +365,51 @@ pub async fn watch(
         {
             let mut conn = pool.acquire().await?;
             let mut tasks: Vec<checkout::CheckoutTask> = vec![];
-            for r in cfg.repos.iter().filter(|r| r.checkout_on_sync.unwrap_or(false)) {
+            let mut seen: HashSet<(i64, String)> = HashSet::new();
+            let push_task = |tasks: &mut Vec<checkout::CheckoutTask>,
+                                 seen: &mut HashSet<(i64, String)>,
+                                 repo_id: i64,
+                                 owner: &str,
+                                 name: &str,
+                                 branch: String,
+                                 fs_owner: String| {
+                if seen.insert((repo_id, branch.clone())) {
+                    tasks.push(checkout::CheckoutTask {
+                        repo_id,
+                        owner: owner.to_owned(),
+                        name: name.to_owned(),
+                        branch,
+                        fs_owner,
+                    });
+                }
+            };
+
+            for r in &cfg.repos {
+                let wants_branches = r.checkout_on_sync.unwrap_or(false);
+                let wants_pr_branches = r.checkout_pr_branches.unwrap_or(false);
+                if !wants_branches && !wants_pr_branches { continue; }
                 let repo_id = match db::get_repo_id(&mut *conn, &r.owner, &r.name).await {
                     Ok(Some(id)) => id,
                     _ => continue,
                 };
-                for b in r.sync_branches.as_deref().unwrap_or(&[]) {
-                    tasks.push(checkout::CheckoutTask {
-                        repo_id,
-                        owner:    r.owner.clone(),
-                        name:     r.name.clone(),
-                        branch:   b.clone(),
-                        fs_owner: r.fs_owner().to_owned(),
-                    });
+                if wants_branches {
+                    for b in r.sync_branches.as_deref().unwrap_or(&[]) {
+                        push_task(&mut tasks, &mut seen, repo_id, &r.owner, &r.name,
+                                  b.clone(), r.fs_owner().to_owned());
+                    }
+                }
+                if wants_pr_branches {
+                    for b in pr_head_refs(&mut *conn, repo_id).await {
+                        push_task(&mut tasks, &mut seen, repo_id, &r.owner, &r.name,
+                                  b, r.fs_owner().to_owned());
+                    }
                 }
             }
 
-            for org in cfg.orgs.iter().filter(|o| o.checkout_on_sync.unwrap_or(false)) {
+            for org in &cfg.orgs {
+                let wants_branches = org.checkout_on_sync.unwrap_or(false);
+                let wants_pr_branches = org.checkout_pr_branches.unwrap_or(false);
+                if !wants_branches && !wants_pr_branches { continue; }
                 let rows: Vec<(i64, String)> = sqlx::query_as(
                     "SELECT id, name FROM repo WHERE owner = ?",
                 )
@@ -377,14 +418,17 @@ pub async fn watch(
                 .await
                 .unwrap_or_default();
                 for (repo_id, name) in rows {
-                    for branch in org.sync_branches.as_deref().unwrap_or(&[]) {
-                        tasks.push(checkout::CheckoutTask {
-                            repo_id,
-                            owner:    org.owner.clone(),
-                            name:     name.clone(),
-                            branch:   branch.clone(),
-                            fs_owner: org.fs_owner().to_owned(),
-                        });
+                    if wants_branches {
+                        for branch in org.sync_branches.as_deref().unwrap_or(&[]) {
+                            push_task(&mut tasks, &mut seen, repo_id, &org.owner, &name,
+                                      branch.clone(), org.fs_owner().to_owned());
+                        }
+                    }
+                    if wants_pr_branches {
+                        for branch in pr_head_refs(&mut *conn, repo_id).await {
+                            push_task(&mut tasks, &mut seen, repo_id, &org.owner, &name,
+                                      branch, org.fs_owner().to_owned());
+                        }
                     }
                 }
             }
@@ -436,7 +480,7 @@ mod tests {
                 sync_notifications:   Some(false),
                 sync_branches:        None,
                 checkout_on_sync:     None,
-                poll_interval_seconds: None,
+                checkout_pr_branches: None,
                 fs_alias:             None,
             }],
             orgs: vec![],
@@ -446,6 +490,43 @@ mod tests {
 
     fn all_filter() -> SyncFilter {
         SyncFilter { repo: None, prs_only: false, notifs_only: false, events_only: false }
+    }
+
+    #[tokio::test]
+    async fn pr_head_refs_returns_distinct_open_branches() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+
+        let now = "2026-01-01T00:00:00Z";
+        for (n, head, state) in [
+            (1i64, "feature-a", "open"),
+            (2, "feature-b", "open"),
+            (3, "feature-a", "open"),    // dup head -- DISTINCT collapses
+            (4, "old-thing", "closed"),  // closed -- excluded
+            (5, "merged-thing", "merged"), // merged -- excluded
+        ] {
+            sqlx::query(
+                "INSERT INTO pull_request
+                 (repo_id, number, state, title, head_sha, head_ref, base_ref, draft, created_at, updated_at)
+                 VALUES (?, ?, ?, 't', 'sha', ?, 'main', 0, ?, ?)",
+            )
+            .bind(repo_id).bind(n).bind(state).bind(head).bind(now).bind(now)
+            .execute(&mut *c).await.unwrap();
+        }
+
+        // Empty / NULL head_ref -- excluded
+        sqlx::query(
+            "INSERT INTO pull_request
+             (repo_id, number, state, title, head_sha, head_ref, base_ref, draft, created_at, updated_at)
+             VALUES (?, 99, 'open', 't', 'sha', NULL, 'main', 0, ?, ?)",
+        )
+        .bind(repo_id).bind(now).bind(now)
+        .execute(&mut *c).await.unwrap();
+
+        let mut refs = pr_head_refs(&mut *c, repo_id).await;
+        refs.sort();
+        assert_eq!(refs, vec!["feature-a".to_string(), "feature-b".to_string()]);
     }
 
     #[tokio::test]
@@ -485,7 +566,7 @@ mod tests {
             sync_notifications: Some(false),
             sync_branches: None,
             checkout_on_sync: None,
-            poll_interval_seconds: None,
+            checkout_pr_branches: None,
             fs_alias: None,
         });
 
@@ -571,7 +652,7 @@ mod integration {
                 sync_notifications:   Some(false),
                 sync_branches:        Some(vec!["main".into()]),
                 checkout_on_sync:     None,
-                poll_interval_seconds: None,
+                checkout_pr_branches: None,
                 fs_alias:             None,
             }],
             orgs: vec![],

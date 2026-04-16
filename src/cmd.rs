@@ -9,9 +9,6 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
-pub const DEFAULT_PORT: u16 = 7748;
-pub const DEFAULT_TTL_SECS: u64 = 30;
-
 // ── Subscription state ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -56,11 +53,6 @@ impl Subscriptions {
             ttl,
             sync_notify: tokio::sync::Notify::new(),
         })
-    }
-
-    /// Wake the watch loop so it syncs immediately.
-    pub fn notify_sync(&self) {
-        self.sync_notify.notify_one();
     }
 
     /// Wait until notified or timeout. Returns `true` if woken by notify.

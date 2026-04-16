@@ -58,7 +58,9 @@ pub struct RepoConfig {
     pub sync_events: Option<bool>,
     pub sync_branches: Option<Vec<String>>,
     pub checkout_on_sync: Option<bool>,
-    pub poll_interval_seconds: Option<u64>,
+    /// Also fetch the head_ref of every open PR into the local clone.
+    /// Fork PRs whose head branch isn't on origin are silently skipped.
+    pub checkout_pr_branches: Option<bool>,
     /// Short alias used as the owner directory name on disk instead of `owner`.
     pub fs_alias: Option<String>,
 }
@@ -73,7 +75,8 @@ pub struct OrgConfig {
     pub sync_events: Option<bool>,
     pub sync_branches: Option<Vec<String>>,
     pub checkout_on_sync: Option<bool>,
-    pub poll_interval_seconds: Option<u64>,
+    /// Also fetch the head_ref of every open PR into each repo's local clone.
+    pub checkout_pr_branches: Option<bool>,
     /// Repo names to skip (exact match)
     #[serde(default)]
     pub exclude: Vec<String>,
@@ -89,12 +92,6 @@ impl RepoConfig {
     /// Directory name for this owner on disk (fs_alias if set, otherwise owner).
     pub fn fs_owner(&self) -> &str {
         self.fs_alias.as_deref().unwrap_or(&self.owner)
-    }
-
-    pub fn poll_interval(&self, global: &Global) -> u64 {
-        self.poll_interval_seconds
-            .or(global.poll_interval_seconds)
-            .unwrap_or(60)
     }
 }
 
@@ -318,52 +315,10 @@ name = "backend"
             sync_events: None,
             sync_branches: None,
             checkout_on_sync: None,
-            poll_interval_seconds: None,
+            checkout_pr_branches: None,
             fs_alias: None,
         };
         assert_eq!(r.slug(), "myorg/backend");
-    }
-
-    #[test]
-    fn poll_interval_falls_back_to_global() {
-        let global = Global {
-            poll_interval_seconds: Some(120),
-            ..Default::default()
-        };
-        let r = RepoConfig {
-            owner: "o".into(),
-            name: "n".into(),
-            default_branch: None,
-            sync_prs: None,
-            sync_notifications: None,
-            sync_events: None,
-            sync_branches: None,
-            checkout_on_sync: None,
-            poll_interval_seconds: None,
-            fs_alias: None,
-        };
-        assert_eq!(r.poll_interval(&global), 120);
-    }
-
-    #[test]
-    fn poll_interval_repo_overrides_global() {
-        let global = Global {
-            poll_interval_seconds: Some(120),
-            ..Default::default()
-        };
-        let r = RepoConfig {
-            owner: "o".into(),
-            name: "n".into(),
-            default_branch: None,
-            sync_prs: None,
-            sync_notifications: None,
-            sync_events: None,
-            sync_branches: None,
-            checkout_on_sync: None,
-            poll_interval_seconds: Some(30),
-            fs_alias: None,
-        };
-        assert_eq!(r.poll_interval(&global), 30);
     }
 
     #[test]
@@ -386,13 +341,11 @@ owner = "myorg"
 name = "frontend"
 default_branch = "main"
 sync_prs = true
-poll_interval_seconds = 30
 "#,
         );
         let cfg = load(Some(f.path())).unwrap();
         assert_eq!(cfg.repos.len(), 2);
         assert_eq!(cfg.repos[1].name, "frontend");
-        assert_eq!(cfg.repos[1].poll_interval_seconds, Some(30));
         assert_eq!(
             cfg.repos[0].sync_branches.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
             Some(vec!["main", "staging", "release/*"])

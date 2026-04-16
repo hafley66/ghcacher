@@ -160,7 +160,7 @@ sync_notifications   = true
 sync_events          = true
 sync_branches        = ["main"]
 checkout_on_sync     = false
-poll_interval_seconds = 60
+checkout_pr_branches = false             # also fetch every open PR's head_ref
 exclude              = ["archived-repo", "scratch"]   # repo names to skip
 
 # Or target specific repos explicitly.
@@ -173,7 +173,8 @@ sync_notifications   = true
 sync_events          = true
 sync_branches        = ["main", "staging", "release/*"]  # glob trailing * supported
 checkout_on_sync     = false   # if true, watch loop runs checkout for sync_branches
-poll_interval_seconds = 30    # overrides global for this repo
+checkout_pr_branches = false   # if true, also fetch every open PR's head_ref (fork PRs whose
+                               # branch isn't on origin are skipped with a warn)
 ```
 
 ### `fs_alias` -- shorter checkout paths
@@ -266,7 +267,10 @@ Org repo discovery is cached for 24 hours between API calls.
 - `--no-sync` starts the HTTP server only, with no sync loop
 - `--daemon` double-forks to background and redirects stdio to `/dev/null`
 
-Runs `checkout` for repos with `checkout_on_sync = true` after each sync pass.
+Runs `checkout` for repos with `checkout_on_sync = true` after each sync pass. If
+`checkout_pr_branches = true`, the watch loop also fetches every open PR's head_ref
+into the same local clone (driven by PushEvent → PR re-sync, so feature branches
+stay current without polling all branches).
 
 Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below).
 

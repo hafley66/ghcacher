@@ -102,7 +102,9 @@ enum Cmd {
         are re-fetched via GraphQL. Full-sweep PR queries are batched (up to 20 repos \
         per GraphQL call) to minimize API consumption. Most polls are free 304 responses.\n\n\
         Repos with checkout_on_sync = true in config have their sync_branches checked out \
-        into staging_folder after each pass.\n\n\
+        into staging_folder after each pass. With checkout_pr_branches = true, the head_ref \
+        of every open PR is also fetched into the same local clone (fork PRs whose branch \
+        isn't on origin are skipped with a warn).\n\n\
         Also starts the HTTP command server on 127.0.0.1:{cmd_port} (default 7748).\n\
         Endpoints: GET /events (SSE), POST /subscribe, POST /heartbeat, POST /pause, POST /resume.\n\n\
         --full-sweep: force a full PR re-fetch on startup even if data is cached.\n\
@@ -134,7 +136,8 @@ enum Cmd {
         Subsequent:     git fetch origin branch && git reset --hard FETCH_HEAD\n\
         (skipped if branch.sha in DB matches last recorded checkout sha)\n\n\
         Requires staging_folder in config and the repo to exist in the DB (run sync first).\n\
-        watch runs this automatically for repos with checkout_on_sync = true.")]
+        watch runs this automatically for repos with checkout_on_sync = true (and for every \
+        open PR's head_ref when checkout_pr_branches = true).")]
     Checkout {
         /// owner/name
         repo: String,

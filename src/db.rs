@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
+use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions};
+#[cfg(test)]
+use sqlx::sqlite::SqlitePoolOptions;
 use std::path::Path;
 
 pub async fn open(path: &Path) -> Result<SqlitePool> {
@@ -23,6 +25,7 @@ pub async fn open(path: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
+#[cfg(test)]
 pub async fn open_in_memory() -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

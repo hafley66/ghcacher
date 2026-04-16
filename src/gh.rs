@@ -407,7 +407,6 @@ fn parse_paginated_body(body: &str) -> Result<serde_json::Value> {
 #[cfg(test)]
 pub(crate) struct MockGhClient {
     pub graphql_calls: std::sync::Mutex<Vec<(String, String)>>,
-    pub rest_calls:    std::sync::Mutex<Vec<String>>,
     graphql_queue:     std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
     rest_queue:        std::sync::Mutex<std::collections::VecDeque<(u16, serde_json::Value)>>,
 }
@@ -417,7 +416,6 @@ impl MockGhClient {
     pub fn new() -> Self {
         MockGhClient {
             graphql_calls: std::sync::Mutex::new(vec![]),
-            rest_calls:    std::sync::Mutex::new(vec![]),
             graphql_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             rest_queue:    std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
@@ -438,17 +436,12 @@ impl MockGhClient {
     pub fn graphql_call_count(&self) -> usize {
         self.graphql_calls.lock().unwrap().len()
     }
-
-    pub fn rest_call_count(&self) -> usize {
-        self.rest_calls.lock().unwrap().len()
-    }
 }
 
 #[cfg(test)]
 #[async_trait]
 impl GitHubClient for MockGhClient {
-    async fn call(&self, _conn: &mut SqliteConnection, req: &GhRequest<'_>) -> Result<GhResponse> {
-        self.rest_calls.lock().unwrap().push(req.endpoint.to_owned());
+    async fn call(&self, _conn: &mut SqliteConnection, _req: &GhRequest<'_>) -> Result<GhResponse> {
         let (status, body) = self.rest_queue.lock().unwrap().pop_front()
             .unwrap_or((200, serde_json::json!([])));
         Ok(GhResponse { status, headers: HashMap::new(), body, duration_ms: 0 })

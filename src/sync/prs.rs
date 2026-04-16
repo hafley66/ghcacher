@@ -53,16 +53,6 @@ pub async fn upsert_pr_for_test(conn: &mut SqliteConnection, repo_id: i64, pr: &
     upsert_pr(conn, repo_id, "test/repo", pr, !exists).await
 }
 
-pub async fn sync(
-    conn: &mut SqliteConnection,
-    gh: &dyn GitHubClient,
-    repo_id: i64,
-    owner: &str,
-    name: &str,
-) -> Result<()> {
-    sync_batch(conn, gh, &[(repo_id, owner.to_owned(), name.to_owned())]).await
-}
-
 /// Fetch open PRs for multiple repos in a single aliased GraphQL query.
 /// Repos are batched into groups of BATCH_SIZE to stay within query limits.
 const BATCH_SIZE: usize = 20;
