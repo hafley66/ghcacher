@@ -277,6 +277,58 @@ pub async fn run(
     Ok(dirty_repos)
 }
 
+/// Build one CheckoutTask per repo with a checkout_* flag set. `is_dirty` reflects
+/// whether the repo appears in `dirty_repos` this cycle. Skipping and deduplication
+/// is the invariant: N events on repo R produce exactly one task with is_dirty=true.
+pub async fn build_checkout_tasks(
+    conn: &mut sqlx::SqliteConnection,
+    cfg: &ResolvedConfig,
+    dirty_repos: &HashSet<(String, String)>,
+) -> Vec<checkout::CheckoutTask> {
+    let mut tasks: Vec<checkout::CheckoutTask> = vec![];
+
+    for r in &cfg.repos {
+        let wants_on_sync = r.checkout_on_sync.unwrap_or(false);
+        let wants_pr_fetch = r.checkout_pr_branches.unwrap_or(false);
+        if !wants_on_sync && !wants_pr_fetch { continue; }
+        match db::get_repo_id(&mut *conn, &r.owner, &r.name).await {
+            Ok(Some(_)) => {}
+            _ => continue,
+        }
+        let is_dirty = dirty_repos.contains(&(r.owner.clone(), r.name.clone()));
+        tasks.push(checkout::CheckoutTask {
+            owner: r.owner.clone(),
+            name: r.name.clone(),
+            fs_owner: r.fs_owner().to_owned(),
+            is_dirty,
+        });
+    }
+
+    for org in &cfg.orgs {
+        let wants_on_sync = org.checkout_on_sync.unwrap_or(false);
+        let wants_pr_fetch = org.checkout_pr_branches.unwrap_or(false);
+        if !wants_on_sync && !wants_pr_fetch { continue; }
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM repo WHERE owner = ?",
+        )
+        .bind(&org.owner)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap_or_default();
+        for name in names {
+            let is_dirty = dirty_repos.contains(&(org.owner.clone(), name.clone()));
+            tasks.push(checkout::CheckoutTask {
+                owner: org.owner.clone(),
+                name,
+                fs_owner: org.fs_owner().to_owned(),
+                is_dirty,
+            });
+        }
+    }
+
+    tasks
+}
+
 pub async fn watch(
     pool: &SqlitePool,
     gh: &dyn GitHubClient,
@@ -360,51 +412,10 @@ pub async fn watch(
         };
         first_run = false;
 
-        // Checkout tasks: one per repo, gated by in-memory dirty signal for PR fetches
-        // and by DB branch.sha comparison for primary-branch resets.
+        // Checkout tasks: one per repo, gated by in-memory dirty signal.
         {
             let mut conn = pool.acquire().await?;
-            let mut tasks: Vec<checkout::CheckoutTask> = vec![];
-
-            for r in &cfg.repos {
-                let wants_on_sync = r.checkout_on_sync.unwrap_or(false);
-                let wants_pr_fetch = r.checkout_pr_branches.unwrap_or(false);
-                if !wants_on_sync && !wants_pr_fetch { continue; }
-                match db::get_repo_id(&mut *conn, &r.owner, &r.name).await {
-                    Ok(Some(_)) => {}
-                    _ => continue,
-                }
-                let is_dirty = dirty_repos.contains(&(r.owner.clone(), r.name.clone()));
-                tasks.push(checkout::CheckoutTask {
-                    owner: r.owner.clone(),
-                    name: r.name.clone(),
-                    fs_owner: r.fs_owner().to_owned(),
-                    is_dirty,
-                });
-            }
-
-            for org in &cfg.orgs {
-                let wants_on_sync = org.checkout_on_sync.unwrap_or(false);
-                let wants_pr_fetch = org.checkout_pr_branches.unwrap_or(false);
-                if !wants_on_sync && !wants_pr_fetch { continue; }
-                let names: Vec<String> = sqlx::query_scalar(
-                    "SELECT name FROM repo WHERE owner = ?",
-                )
-                .bind(&org.owner)
-                .fetch_all(&mut *conn)
-                .await
-                .unwrap_or_default();
-                for name in names {
-                    let is_dirty = dirty_repos.contains(&(org.owner.clone(), name.clone()));
-                    tasks.push(checkout::CheckoutTask {
-                        owner: org.owner.clone(),
-                        name,
-                        fs_owner: org.fs_owner().to_owned(),
-                        is_dirty,
-                    });
-                }
-            }
-
+            let tasks = build_checkout_tasks(&mut *conn, cfg, &dirty_repos).await;
             if !tasks.is_empty() {
                 if let Err(e) = checkout::checkout_all(&cfg.staging_folder, &tasks).await {
                     tracing::error!(error = %e, "checkout_all failed");
@@ -542,6 +553,89 @@ mod tests {
         assert!(endpoint.contains("targeted"), "expected targeted endpoint, got {endpoint}");
         assert!(query.contains("pr_42"), "expected alias pr_42 in query");
         assert!(query.contains("pr_17"), "expected alias pr_17 in query");
+    }
+
+    #[tokio::test]
+    async fn n_events_produce_one_dirty_checkout_task() {
+        // Invariant under test: no matter how many events land for a repo this cycle,
+        // the watch loop emits exactly one CheckoutTask with is_dirty=true for it.
+        let pool = db::open_in_memory().await.unwrap();
+        let mock = MockGhClient::new();
+        mock.push_rest(serde_json::json!([
+            {"id": "1", "type": "PushEvent", "actor": {"login": "a"},
+             "payload": {"ref": "refs/heads/main"}, "created_at": "2026-04-17T00:00:00Z"},
+            {"id": "2", "type": "PushEvent", "actor": {"login": "b"},
+             "payload": {"ref": "refs/heads/feature-x"}, "created_at": "2026-04-17T00:00:01Z"},
+            {"id": "3", "type": "PullRequestEvent", "actor": {"login": "c"},
+             "payload": {"number": 42, "action": "opened"}, "created_at": "2026-04-17T00:00:02Z"},
+            {"id": "4", "type": "PullRequestEvent", "actor": {"login": "d"},
+             "payload": {"number": 17, "action": "synchronize"}, "created_at": "2026-04-17T00:00:03Z"},
+            {"id": "5", "type": "PushEvent", "actor": {"login": "e"},
+             "payload": {"ref": "refs/heads/main"}, "created_at": "2026-04-17T00:00:04Z"},
+        ]));
+        mock.push_graphql(serde_json::json!({"repo_0": {"pullRequests": {"nodes": []}}}));
+
+        let mut cfg = cfg_with_repo("o", "n");
+        cfg.repos[0].checkout_pr_branches = Some(true);
+
+        let dirty = run(&pool, &mock, &cfg, all_filter(), true, &[], &[], "testuser")
+            .await
+            .unwrap();
+
+        assert_eq!(dirty.len(), 1, "N events collapse to one dirty-repo entry");
+        assert!(dirty.contains(&("o".into(), "n".into())));
+
+        let mut conn = pool.acquire().await.unwrap();
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty).await;
+
+        let matching: Vec<_> = tasks.iter()
+            .filter(|t| t.owner == "o" && t.name == "n" && t.is_dirty)
+            .collect();
+        assert_eq!(matching.len(), 1,
+            "5 events must collapse to exactly one dirty CheckoutTask, got {}: {:?}",
+            matching.len(),
+            tasks.iter().map(|t| (&t.owner, &t.name, t.is_dirty)).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn zero_events_produce_no_dirty_checkout_task() {
+        // Flip side of the cardinality invariant: silent repo => task present
+        // (so first-run clone still works) but is_dirty=false => no fetch.
+        let pool = db::open_in_memory().await.unwrap();
+        let mock = MockGhClient::new();
+        mock.push_rest_304();
+        mock.push_graphql(serde_json::json!({"repo_0": {"pullRequests": {"nodes": []}}}));
+
+        let mut cfg = cfg_with_repo("o", "n");
+        cfg.repos[0].checkout_pr_branches = Some(true);
+
+        let dirty = run(&pool, &mock, &cfg, all_filter(), true, &[], &[], "testuser")
+            .await
+            .unwrap();
+        assert!(dirty.is_empty(), "304 events => no dirty repos");
+
+        let mut conn = pool.acquire().await.unwrap();
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty).await;
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].is_dirty, "no activity => is_dirty must be false");
+    }
+
+    #[tokio::test]
+    async fn repo_without_checkout_flags_is_not_tasked() {
+        // Second cardinality invariant: repos without any checkout_* flag never
+        // generate a task even if dirty.
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let _ = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+        drop(c);
+
+        let cfg = cfg_with_repo("o", "n"); // no checkout flags set
+        let mut dirty = HashSet::new();
+        dirty.insert(("o".to_string(), "n".to_string()));
+
+        let mut conn = pool.acquire().await.unwrap();
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty).await;
+        assert_eq!(tasks.len(), 0, "repos without checkout_* flags must not be tasked");
     }
 
     #[tokio::test]
