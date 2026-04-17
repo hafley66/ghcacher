@@ -218,7 +218,7 @@ pub async fn run(
             }
 
             if filter.do_prs() && repo.sync_prs.unwrap_or(false) {
-                if full_sweep || filter.prs_only {
+                if full_sweep {
                     needs_pr_batch = true;
                 } else {
                     prs::sync_targeted(&mut *tx, gh, repo_id, &repo.owner, &repo.name, &dirty_prs).await?;

@@ -201,15 +201,14 @@ pub async fn sync_org(
                     .fetch_one(&mut *conn)
                     .await?;
                 db::log_change(conn, "repo_event", row_id, ChangeEvent::Inserted, Some(full_slug), None).await?;
-                // Ensure the repo appears in dirty even for non-PR events (e.g. PushEvent)
-                // so callers know this repo had activity.
-                dirty.entry(repo_name.to_string()).or_default();
                 if let Some(pr_num) = pr_number_from_event(ev_type, payload) {
                     dirty.entry(repo_name.to_string()).or_default().push(pr_num);
                 } else if ev_type == "PushEvent" {
                     if let Some(branch) = payload["ref"].as_str().and_then(|r| r.strip_prefix("refs/heads/")) {
                         let prs = pr_numbers_from_branch(conn, repo_id, branch).await;
-                        dirty.entry(repo_name.to_string()).or_default().extend(prs);
+                        if !prs.is_empty() {
+                            dirty.entry(repo_name.to_string()).or_default().extend(prs);
+                        }
                     }
                 } else if let Some(sha) = sha_from_ci_event(ev_type, payload) {
                     if let Some(pr_num) = pr_number_from_sha(conn, repo_id, sha).await {
