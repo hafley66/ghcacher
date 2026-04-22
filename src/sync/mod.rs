@@ -291,16 +291,17 @@ pub async fn build_checkout_tasks(
         let wants_on_sync = r.checkout_on_sync.unwrap_or(false);
         let wants_pr_fetch = r.checkout_pr_branches.unwrap_or(false);
         if !wants_on_sync && !wants_pr_fetch { continue; }
-        match db::get_repo_id(&mut *conn, &r.owner, &r.name).await {
-            Ok(Some(_)) => {}
+        let default_branch = match db::get_repo_default_branch(&mut *conn, &r.owner, &r.name).await {
+            Ok(Some(b)) => b,
             _ => continue,
-        }
+        };
         let is_dirty = dirty_repos.contains(&(r.owner.clone(), r.name.clone()));
         tasks.push(checkout::CheckoutTask {
             owner: r.owner.clone(),
             name: r.name.clone(),
             fs_owner: r.fs_owner().to_owned(),
             is_dirty,
+            default_branch,
         });
     }
 
@@ -308,20 +309,21 @@ pub async fn build_checkout_tasks(
         let wants_on_sync = org.checkout_on_sync.unwrap_or(false);
         let wants_pr_fetch = org.checkout_pr_branches.unwrap_or(false);
         if !wants_on_sync && !wants_pr_fetch { continue; }
-        let names: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM repo WHERE owner = ?",
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, default_branch FROM repo WHERE owner = ?",
         )
         .bind(&org.owner)
         .fetch_all(&mut *conn)
         .await
         .unwrap_or_default();
-        for name in names {
+        for (name, default_branch) in rows {
             let is_dirty = dirty_repos.contains(&(org.owner.clone(), name.clone()));
             tasks.push(checkout::CheckoutTask {
                 owner: org.owner.clone(),
                 name,
                 fs_owner: org.fs_owner().to_owned(),
                 is_dirty,
+                default_branch,
             });
         }
     }

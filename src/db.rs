@@ -109,6 +109,21 @@ pub async fn get_repo_id(
     Ok(id)
 }
 
+pub async fn get_repo_default_branch(
+    conn: &mut SqliteConnection,
+    owner: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    let branch = sqlx::query_scalar(
+        "SELECT default_branch FROM repo WHERE owner = ? AND name = ?"
+    )
+    .bind(owner)
+    .bind(name)
+    .fetch_optional(conn)
+    .await?;
+    Ok(branch)
+}
+
 // ---- poll_state --------------------------------------------------------
 
 pub struct PollState {
@@ -295,6 +310,22 @@ mod tests {
         let mut c = pool.acquire().await.unwrap();
         let id = upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
         assert_eq!(get_repo_id(&mut *c, "o", "n").await.unwrap(), Some(id));
+    }
+
+    #[tokio::test]
+    async fn get_repo_default_branch_roundtrip() {
+        let pool = open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        upsert_repo(&mut *c, "o", "n", "develop").await.unwrap();
+        let branch = get_repo_default_branch(&mut *c, "o", "n").await.unwrap();
+        assert_eq!(branch, Some("develop".into()));
+    }
+
+    #[tokio::test]
+    async fn get_repo_default_branch_missing_returns_none() {
+        let pool = open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        assert!(get_repo_default_branch(&mut *c, "x", "y").await.unwrap().is_none());
     }
 
     #[tokio::test]
