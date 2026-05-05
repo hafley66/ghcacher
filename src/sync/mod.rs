@@ -180,10 +180,15 @@ pub async fn run(
         }
 
         // For org repos in targeted mode, skip entirely if no events this pass.
+        // Always let new (unseen) repos through so they get upserted.
         let is_org_repo = org_owners.contains(&repo.owner);
         let org_has_activity = org_dirty.contains_key(&(repo.owner.clone(), repo.name.clone()));
         if !full_sweep && is_org_repo && !org_has_activity && filter.all() {
-            continue;
+            let mut c = pool.acquire().await?;
+            let known = db::get_repo_id(&mut *c, &repo.owner, &repo.name).await?.is_some();
+            if known {
+                continue;
+            }
         }
 
         tracing::info!(repo = %repo.slug(), full_sweep, "syncing");
@@ -522,6 +527,49 @@ mod tests {
 
         // Both repos should be packed into a single GraphQL call
         assert_eq!(mock.graphql_call_count(), 1, "expected 1 batched GraphQL call, got {}", mock.graphql_call_count());
+    }
+
+    #[tokio::test]
+    async fn new_org_repo_upserted_even_when_no_activity() {
+        // Org repo with no org-event activity in targeted mode should not be skipped
+        // if it has never been seen before (not in DB). After run it must exist in DB.
+        let pool = db::open_in_memory().await.unwrap();
+        let mock = MockGhClient::new();
+        // REST: org repo discovery returns one repo.
+        mock.push_rest(serde_json::json!([{"name": "r"}]));
+        // No org events sync (sync_events=false on org), no PR sync (sync_prs=false).
+
+        let cfg = ResolvedConfig {
+            db_path:               std::path::PathBuf::from(":memory:"),
+            staging_folder:        std::path::PathBuf::from("/tmp"),
+            poll_interval_seconds: 60,
+            log_level:             "info".into(),
+            gh_binary:             "gh".into(),
+            rate_warn_threshold:   500,
+            rate_stop_threshold:   50,
+            cmd_port:              7748,
+            heartbeat_ttl_seconds: 30,
+            sync_notifications:    false,
+            repos: vec![],
+            orgs: vec![crate::config::OrgConfig {
+                owner:               "o".into(),
+                sync_prs:            Some(false),
+                sync_events:         Some(false),
+                sync_notifications:  Some(false),
+                sync_branches:       None,
+                checkout_on_sync:    None,
+                checkout_pr_branches: None,
+                exclude:             vec![],
+                fs_alias:            None,
+            }],
+            owner_fs_aliases: std::collections::HashMap::new(),
+        };
+
+        run(&pool, &mock, &cfg, all_filter(), false, &[], &[], "testuser").await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let id = db::get_repo_id(&mut *conn, "o", "r").await.unwrap();
+        assert!(id.is_some(), "new org repo must be upserted even with no activity");
     }
 
     #[tokio::test]
