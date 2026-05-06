@@ -11,7 +11,7 @@ pub async fn sync(
     owner: &str,
     name: &str,
     patterns: &[String],
-) -> Result<()> {
+) -> Result<bool> {
     let endpoint = format!("/repos/{owner}/{name}/branches");
     let poll = db::get_poll_state(conn, &endpoint).await?;
 
@@ -24,18 +24,18 @@ pub async fn sync(
 
     if resp.is_not_modified() {
         tracing::debug!(repo = %format!("{owner}/{name}"), "branches: 304 not modified");
-        return Ok(());
+        return Ok(false);
     }
 
     let branches = match resp.body.as_array() {
         Some(a) => a,
-        None => return Ok(()),
+        None => return Ok(false),
     };
 
     let slug = format!("{owner}/{name}");
 
-    let existing: std::collections::HashSet<String> = sqlx::query_scalar(
-        "SELECT name FROM branch WHERE repo_id = ?",
+    let existing: std::collections::HashMap<String, Option<String>> = sqlx::query_as(
+        "SELECT name, sha FROM branch WHERE repo_id = ?",
     )
     .bind(repo_id)
     .fetch_all(&mut *conn)
@@ -44,6 +44,7 @@ pub async fn sync(
     .collect();
 
     let mut synced = 0usize;
+    let mut had_changes = false;
     for branch in branches {
         let branch_name = match branch["name"].as_str() {
             Some(n) => n,
@@ -55,8 +56,12 @@ pub async fn sync(
         }
 
         let sha = branch["commit"]["sha"].as_str();
+        let old_sha = existing.get(branch_name).cloned().flatten();
+        if old_sha.as_deref() != sha {
+            had_changes = true;
+        }
         let now = chrono::Utc::now().to_rfc3339();
-        let is_new = !existing.contains(branch_name);
+        let is_new = !existing.contains_key(branch_name);
 
         let branch_id: i64 = sqlx::query_scalar(
             "INSERT INTO branch (repo_id, name, sha, updated_at)
@@ -79,7 +84,7 @@ pub async fn sync(
     }
 
     tracing::info!(repo = %format!("{owner}/{name}"), synced, "branches synced");
-    Ok(())
+    Ok(had_changes)
 }
 
 fn matches_glob(pattern: &str, name: &str) -> bool {

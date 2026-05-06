@@ -44,7 +44,7 @@ async fn discover_org_repos(
     conn: &mut sqlx::SqliteConnection,
     gh: &dyn GitHubClient,
     owner: &str,
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, Option<String>)>> {
     let org_endpoint  = format!("/orgs/{owner}/repos?per_page=100");
     let user_endpoint = format!("/users/{owner}/repos?per_page=100");
 
@@ -87,31 +87,35 @@ async fn discover_org_repos(
         }
     };
 
-    let names: Vec<String> = body
+    let repos: Vec<(String, Option<String>)> = body
         .as_array()
-        .map(|arr| arr.iter().filter_map(|r| r["name"].as_str().map(str::to_owned)).collect())
+        .map(|arr| arr.iter().filter_map(|r| {
+            let name = r["name"].as_str().map(str::to_owned)?;
+            let default_branch = r["default_branch"].as_str().map(str::to_owned);
+            Some((name, default_branch))
+        }).collect())
         .unwrap_or_default();
 
-    tracing::info!(owner, count = names.len() as u64, "discovered org repos");
-    Ok(names)
+    tracing::info!(owner, count = repos.len() as u64, "discovered org repos");
+    Ok(repos)
 }
 
-async fn repos_from_db(conn: &mut sqlx::SqliteConnection, owner: &str) -> Result<Vec<String>> {
-    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM repo WHERE owner = ? ORDER BY name")
+async fn repos_from_db(conn: &mut sqlx::SqliteConnection, owner: &str) -> Result<Vec<(String, Option<String>)>> {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT name, default_branch FROM repo WHERE owner = ? ORDER BY name")
         .bind(owner)
         .fetch_all(conn)
         .await?;
-    Ok(names)
+    Ok(rows.into_iter().map(|(n, b)| (n, Some(b))).collect())
 }
 
-fn org_to_repos(org: &OrgConfig, names: Vec<String>) -> Vec<RepoConfig> {
-    names
+fn org_to_repos(org: &OrgConfig, repos: Vec<(String, Option<String>)>) -> Vec<RepoConfig> {
+    repos
         .into_iter()
-        .filter(|n| !org.exclude.contains(n))
-        .map(|name| RepoConfig {
+        .filter(|(n, _)| !org.exclude.contains(n))
+        .map(|(name, default_branch)| RepoConfig {
             owner:                org.owner.clone(),
             name,
-            default_branch:       None,
+            default_branch,
             sync_prs:             org.sync_prs,
             sync_notifications:   org.sync_notifications,
             sync_events:          org.sync_events,
@@ -179,17 +183,7 @@ pub async fn run(
             if &repo.slug() != slug { continue; }
         }
 
-        // For org repos in targeted mode, skip entirely if no events this pass.
-        // Always let new (unseen) repos through so they get upserted.
         let is_org_repo = org_owners.contains(&repo.owner);
-        let org_has_activity = org_dirty.contains_key(&(repo.owner.clone(), repo.name.clone()));
-        if !full_sweep && is_org_repo && !org_has_activity && filter.all() {
-            let mut c = pool.acquire().await?;
-            let known = db::get_repo_id(&mut *c, &repo.owner, &repo.name).await?.is_some();
-            if known {
-                continue;
-            }
-        }
 
         tracing::info!(repo = %repo.slug(), full_sweep, "syncing");
 
@@ -231,7 +225,7 @@ pub async fn run(
             }
 
             if repo.sync_branches.as_ref().map(|b| !b.is_empty()).unwrap_or(false) && filter.all() {
-                branches::sync(
+                let changed = branches::sync(
                     &mut *tx,
                     gh,
                     repo_id,
@@ -240,6 +234,9 @@ pub async fn run(
                     repo.sync_branches.as_deref().unwrap_or(&[]),
                 )
                 .await?;
+                if changed {
+                    had_activity = true;
+                }
             }
 
             Ok(())
@@ -267,7 +264,8 @@ pub async fn run(
     // Batched full-sweep PR sync: packs multiple repos per GraphQL call.
     if !pr_batch.is_empty() {
         let mut conn = pool.acquire().await?;
-        prs::sync_batch(&mut *conn, gh, &pr_batch).await?;
+        let pr_changed = prs::sync_batch(&mut *conn, gh, &pr_batch).await?;
+        dirty_repos.extend(pr_changed);
     }
 
     let notifs_needed = filter.do_notifs()
@@ -289,10 +287,11 @@ pub async fn build_checkout_tasks(
     conn: &mut sqlx::SqliteConnection,
     cfg: &ResolvedConfig,
     dirty_repos: &HashSet<(String, String)>,
+    extra_repos: &[RepoConfig],
 ) -> Vec<checkout::CheckoutTask> {
     let mut tasks: Vec<checkout::CheckoutTask> = vec![];
 
-    for r in &cfg.repos {
+    for r in cfg.repos.iter().chain(extra_repos.iter()) {
         let wants_on_sync = r.checkout_on_sync.unwrap_or(false);
         let wants_pr_fetch = r.checkout_pr_branches.unwrap_or(false);
         if !wants_on_sync && !wants_pr_fetch { continue; }
@@ -336,6 +335,23 @@ pub async fn build_checkout_tasks(
     tasks
 }
 
+pub async fn should_skip_full_sweep(pool: &SqlitePool) -> bool {
+    let max_updated: Option<String> = sqlx::query_scalar(
+        "SELECT MAX(updated_at) FROM pull_request",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(None);
+
+    if let Some(ts) = max_updated {
+        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&ts) {
+            let age = chrono::Utc::now().signed_duration_since(last);
+            return age < chrono::Duration::hours(1);
+        }
+    }
+    false
+}
+
 pub async fn watch(
     pool: &SqlitePool,
     gh: &dyn GitHubClient,
@@ -349,19 +365,11 @@ pub async fn watch(
     let mut first_run = if force_full_sweep {
         true
     } else {
-        // Skip full sweep on startup if we have cached PR data.
-        let has_data: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pull_request LIMIT 1)",
-        )
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
-        if has_data {
+        let skip = should_skip_full_sweep(pool).await;
+        if skip {
             tracing::info!("skipping full sweep: PR data is cached and up to date (use --full-sweep to force)");
-            false
-        } else {
-            true
         }
+        !skip
     };
     loop {
         if paused.load(std::sync::atomic::Ordering::Relaxed) {
@@ -422,7 +430,7 @@ pub async fn watch(
         // Checkout tasks: one per repo, gated by in-memory dirty signal.
         {
             let mut conn = pool.acquire().await?;
-            let tasks = build_checkout_tasks(&mut *conn, cfg, &dirty_repos).await;
+            let tasks = build_checkout_tasks(&mut *conn, cfg, &dirty_repos, &extra_repos).await;
             if !tasks.is_empty() {
                 if let Err(e) = checkout::checkout_all(&cfg.staging_folder, &tasks).await {
                     tracing::error!(error = %e, "checkout_all failed");
@@ -445,7 +453,7 @@ pub async fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RepoConfig;
+    use crate::config::{OrgConfig, RepoConfig};
     use crate::db;
     use crate::gh::MockGhClient;
 
@@ -636,7 +644,7 @@ mod tests {
         assert!(dirty.contains(&("o".into(), "n".into())));
 
         let mut conn = pool.acquire().await.unwrap();
-        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty).await;
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty, &[]).await;
 
         let matching: Vec<_> = tasks.iter()
             .filter(|t| t.owner == "o" && t.name == "n" && t.is_dirty)
@@ -665,7 +673,7 @@ mod tests {
         assert!(dirty.is_empty(), "304 events => no dirty repos");
 
         let mut conn = pool.acquire().await.unwrap();
-        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty).await;
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty, &[]).await;
         assert_eq!(tasks.len(), 1);
         assert!(!tasks[0].is_dirty, "no activity => is_dirty must be false");
     }
@@ -684,7 +692,7 @@ mod tests {
         dirty.insert(("o".to_string(), "n".to_string()));
 
         let mut conn = pool.acquire().await.unwrap();
-        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty).await;
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty, &[]).await;
         assert_eq!(tasks.len(), 0, "repos without checkout_* flags must not be tasked");
     }
 
@@ -700,6 +708,221 @@ mod tests {
         run(&pool, &mock, &cfg_with_repo("o", "n"), all_filter(), false, &[], &[], "testuser").await.unwrap();
 
         assert_eq!(mock.graphql_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_skip_sweep_for_stale_data() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+        sqlx::query(
+            "INSERT INTO pull_request (repo_id, number, state, title, head_sha, head_ref, base_ref, draft, created_at, updated_at)
+             VALUES (?, 1, 'open', 'Old', 'abc', 'f', 'main', 0, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"
+        )
+        .bind(repo_id)
+        .execute(&mut *c)
+        .await
+        .unwrap();
+        drop(c);
+
+        let skip = should_skip_full_sweep(&pool).await;
+        assert!(!skip, "should not skip full sweep when PR data is years old");
+    }
+
+    #[tokio::test]
+    async fn org_repo_not_skipped_when_no_org_events() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let _ = db::upsert_repo(&mut *c, "o", "r", "main").await.unwrap();
+        drop(c);
+
+        let mock = MockGhClient::new();
+        mock.push_rest(serde_json::json!([{"name": "r"}]));
+        mock.push_rest(serde_json::json!([]));
+        mock.push_rest(serde_json::json!([{"name": "main", "commit": {"sha": "newsha"}}]));
+
+        let cfg = ResolvedConfig {
+            db_path: std::path::PathBuf::from(":memory:"),
+            staging_folder: std::path::PathBuf::from("/tmp"),
+            poll_interval_seconds: 60,
+            log_level: "info".into(),
+            gh_binary: "gh".into(),
+            rate_warn_threshold: 500,
+            rate_stop_threshold: 50,
+            cmd_port: 7748,
+            heartbeat_ttl_seconds: 30,
+            sync_notifications: false,
+            repos: vec![],
+            orgs: vec![OrgConfig {
+                owner: "o".into(),
+                sync_prs: Some(false),
+                sync_events: Some(true),
+                sync_notifications: Some(false),
+                sync_branches: Some(vec!["main".into()]),
+                checkout_on_sync: None,
+                checkout_pr_branches: None,
+                exclude: vec![],
+                fs_alias: None,
+            }],
+            owner_fs_aliases: std::collections::HashMap::new(),
+        };
+
+        let dirty = run(&pool, &mock, &cfg, all_filter(), false, &[], &[], "testuser")
+            .await
+            .unwrap();
+
+        assert!(dirty.contains(&("o".into(), "r".into())),
+            "known org repo should still be processed (and marked dirty from branch sync) even with no personal org events");
+    }
+
+    #[tokio::test]
+    async fn branch_sync_marks_repo_dirty() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let _ = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+        drop(c);
+
+        let mock = MockGhClient::new();
+        mock.push_rest_304();
+        mock.push_rest(serde_json::json!([{"name": "main", "commit": {"sha": "newsha"}}]));
+
+        let mut cfg = cfg_with_repo("o", "n");
+        cfg.repos[0].sync_branches = Some(vec!["main".into()]);
+
+        let dirty = run(&pool, &mock, &cfg, all_filter(), false, &[], &[], "testuser")
+            .await
+            .unwrap();
+
+        assert!(dirty.contains(&("o".into(), "n".into())),
+            "repo should be dirty when branch SHA changes during sync");
+    }
+
+    #[tokio::test]
+    async fn subscription_repos_get_checkout_tasks() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let _ = db::upsert_repo(&mut *c, "sub", "repo", "main").await.unwrap();
+        drop(c);
+
+        let cfg = cfg_with_repo("o", "n");
+        let mut dirty = HashSet::new();
+        dirty.insert(("sub".into(), "repo".into()));
+
+        let extra = vec![RepoConfig {
+            owner: "sub".into(),
+            name: "repo".into(),
+            default_branch: Some("main".into()),
+            sync_prs: Some(true),
+            sync_events: Some(true),
+            sync_notifications: Some(false),
+            sync_branches: None,
+            checkout_on_sync: Some(true),
+            checkout_pr_branches: None,
+            fs_alias: None,
+        }];
+        let mut conn = pool.acquire().await.unwrap();
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty, &extra).await;
+
+        assert!(tasks.iter().any(|t| t.owner == "sub" && t.name == "repo"),
+            "dirty subscription repo should produce a checkout task");
+    }
+
+    #[tokio::test]
+    async fn org_repo_preserves_api_default_branch() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mock = MockGhClient::new();
+        mock.push_rest(serde_json::json!([{"name": "r", "default_branch": "develop"}]));
+
+        let cfg = ResolvedConfig {
+            db_path: std::path::PathBuf::from(":memory:"),
+            staging_folder: std::path::PathBuf::from("/tmp"),
+            poll_interval_seconds: 60,
+            log_level: "info".into(),
+            gh_binary: "gh".into(),
+            rate_warn_threshold: 500,
+            rate_stop_threshold: 50,
+            cmd_port: 7748,
+            heartbeat_ttl_seconds: 30,
+            sync_notifications: false,
+            repos: vec![],
+            orgs: vec![OrgConfig {
+                owner: "o".into(),
+                sync_prs: Some(false),
+                sync_events: Some(false),
+                sync_notifications: Some(false),
+                sync_branches: None,
+                checkout_on_sync: None,
+                checkout_pr_branches: None,
+                exclude: vec![],
+                fs_alias: None,
+            }],
+            owner_fs_aliases: std::collections::HashMap::new(),
+        };
+
+        run(&pool, &mock, &cfg, all_filter(), true, &[], &[], "testuser")
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let branch = db::get_repo_default_branch(&mut *conn, "o", "r").await.unwrap();
+        assert_eq!(branch, Some("develop".into()), "org repo should preserve default_branch from API");
+    }
+
+    #[tokio::test]
+    async fn full_sweep_pr_updates_mark_repo_dirty() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut c = pool.acquire().await.unwrap();
+        let repo_id = db::upsert_repo(&mut *c, "o", "n", "main").await.unwrap();
+        sqlx::query(
+            "INSERT INTO pull_request (repo_id, number, state, title, head_sha, head_ref, base_ref, draft, created_at, updated_at)
+             VALUES (?, 1, 'open', 'Old', 'oldsha', 'f', 'main', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        .bind(repo_id)
+        .execute(&mut *c)
+        .await
+        .unwrap();
+        drop(c);
+
+        let mock = MockGhClient::new();
+        mock.push_rest_304();
+        mock.push_graphql(serde_json::json!({
+            "repo_0": {
+                "pullRequests": {
+                    "nodes": [{
+                        "number": 1,
+                        "state": "OPEN",
+                        "title": "Updated",
+                        "headRefName": "f",
+                        "headRefOid": "newsha",
+                        "baseRefName": "main",
+                        "isDraft": false,
+                        "mergeable": "MERGEABLE",
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "updatedAt": "2026-01-02T00:00:00Z",
+                        "author": { "login": "alice" },
+                        "additions": 0,
+                        "deletions": 0,
+                        "changedFiles": 0,
+                        "reviews": { "nodes": [] },
+                        "comments": { "nodes": [] },
+                        "labels": { "nodes": [] },
+                        "statusCheckRollup": null,
+                        "mergeCommit": null,
+                        "isReadByViewer": false
+                    }]
+                }
+            }
+        }));
+
+        let mut cfg = cfg_with_repo("o", "n");
+        cfg.repos[0].sync_prs = Some(true);
+
+        let dirty = run(&pool, &mock, &cfg, all_filter(), true, &[], &[], "testuser")
+            .await
+            .unwrap();
+
+        assert!(dirty.contains(&("o".into(), "n".into())),
+            "repo should be dirty when PRs change during full sweep");
     }
 }
 

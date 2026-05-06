@@ -61,8 +61,9 @@ pub async fn sync_batch(
     conn: &mut SqliteConnection,
     gh: &dyn GitHubClient,
     repos: &[(i64, String, String)],
-) -> Result<()> {
-    if repos.is_empty() { return Ok(()); }
+) -> Result<std::collections::HashSet<(String, String)>> {
+    let mut changed = std::collections::HashSet::new();
+    if repos.is_empty() { return Ok(changed); }
 
     for chunk in repos.chunks(BATCH_SIZE) {
         gh.throttle_if_needed(conn, "graphql").await?;
@@ -100,15 +101,47 @@ pub async fn sync_batch(
             .into_iter()
             .collect();
 
+            let mut repo_changed = false;
+            let returned_numbers: std::collections::HashSet<i64> = nodes
+                .iter()
+                .filter_map(|p| p["number"].as_i64())
+                .collect();
+
             for pr in nodes {
                 let number = pr["number"].as_i64().unwrap_or(0);
-                upsert_pr(conn, *repo_id, &slug, pr, !existing.contains(&number)).await?;
+                let is_new = !existing.contains(&number);
+                if is_new {
+                    repo_changed = true;
+                } else {
+                    let old_updated: Option<String> = sqlx::query_scalar(
+                        "SELECT updated_at FROM pull_request WHERE repo_id = ? AND number = ?",
+                    )
+                    .bind(repo_id)
+                    .bind(number)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    let new_updated = pr["updatedAt"].as_str();
+                    if old_updated.as_deref() != new_updated {
+                        repo_changed = true;
+                    }
+                }
+                upsert_pr(conn, *repo_id, &slug, pr, is_new).await?;
+            }
+
+            for existing_num in &existing {
+                if !returned_numbers.contains(existing_num) {
+                    repo_changed = true;
+                }
+            }
+
+            if repo_changed {
+                changed.insert((owner.clone(), name.clone()));
             }
 
             tracing::info!(repo = %slug, count = nodes.len(), "PRs synced");
         }
     }
-    Ok(())
+    Ok(changed)
 }
 
 pub async fn sync_targeted(

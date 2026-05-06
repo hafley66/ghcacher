@@ -75,8 +75,7 @@ pub async fn checkout_all(
                     }
                 }
             } else {
-                tracing::debug!(%slug, "checkout: no new activity, skipping");
-                Ok(())
+                run_fetch(&local_path).await
             };
             (slug, res)
         }));
@@ -425,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_does_no_git_operations_when_not_dirty() {
+    async fn fetch_happens_even_when_not_dirty() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -445,9 +444,33 @@ mod tests {
 
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
-        assert_eq!(before, after, "skip must not touch local HEAD");
-        assert_eq!(before, origin_main, "skip must not fetch origin");
-        assert!(!clone.join("new.txt").exists(), "new file must not appear when skipped");
+        assert_eq!(before, after, "must not touch local HEAD when not dirty");
+        assert_ne!(before, origin_main, "must still fetch origin even when not dirty");
+        assert!(!clone.join("new.txt").exists(), "new file must not appear after fetch-only");
+    }
+
+    #[tokio::test]
+    async fn fetch_always_happens_even_when_not_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let clone = tmp.path().join("o").join("n");
+        tokio::fs::create_dir_all(clone.parent().unwrap()).await.unwrap();
+        setup_origin_and_clone(&origin, &clone).await;
+
+        let before = git_rev_parse(&clone, "origin/main").await;
+        push_new_commit_to_origin(tmp.path(), &origin, "new.txt", "new").await;
+
+        let task = CheckoutTask {
+            owner: "o".into(),
+            name: "n".into(),
+            fs_owner: "o".into(),
+            is_dirty: false,
+            default_branch: "main".into(),
+        };
+        checkout_all(tmp.path(), &[task]).await.unwrap();
+
+        let after = git_rev_parse(&clone, "origin/main").await;
+        assert_ne!(before, after, "origin/main must advance even when not dirty");
     }
 
     #[tokio::test]
