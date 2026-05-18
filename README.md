@@ -159,8 +159,8 @@ sync_prs             = true
 sync_notifications   = true
 sync_events          = true
 sync_branches        = ["main"]
-checkout_on_sync     = false             # run `git fetch origin` on this repo when activity lands
-checkout_pr_branches = false             # same trigger, broader scope: PR head events also count as activity
+checkout_on_sync     = false             # keep local default branch ref fresh after sync/watch passes
+checkout_pr_branches = false             # also mirror refs/pull/*/head into refs/remotes/pr/*/head
 exclude              = ["archived-repo", "scratch"]   # repo names to skip
 
 # Or target specific repos explicitly.
@@ -172,8 +172,8 @@ sync_prs             = true
 sync_notifications   = true
 sync_events          = true
 sync_branches        = ["main", "staging", "release/*"]  # glob trailing * supported
-checkout_on_sync     = false   # if true, watch fetches origin once per cycle when any event lands
-checkout_pr_branches = false   # same trigger; kept separate so you can opt in per-scope
+checkout_on_sync     = false   # if true, watch updates local default branch refs
+checkout_pr_branches = false   # if true, watch mirrors GitHub PR heads via git transport
 ```
 
 ### `fs_alias` -- shorter checkout paths
@@ -254,7 +254,7 @@ PR queries are batched (up to 20 repos per GraphQL call) to minimize API consump
 - `--prs / --notifications / --events` restrict to one data type
 - Always performs a full GraphQL PR fetch (not event-targeted)
 
-### `ghcache watch [--no-sync] [--full-sweep]`
+### `ghcache watch [--no-sync] [--full-sweep] [--local-git-only]`
 Continuous polling loop. On startup, skips the full sweep if the DB already has PR data from a
 previous run. Subsequent iterations are event-targeted: org repos with no new events since the
 last pass are skipped entirely (no API calls, no transaction). Only repos with activity get
@@ -264,13 +264,20 @@ Org repo discovery is cached for 24 hours between API calls.
 
 - `--full-sweep` forces a complete PR re-fetch on startup even if data is cached
 - `--no-sync` starts the HTTP server only, with no sync loop
+- `--local-git-only` skips GitHub REST/GraphQL sync and only updates local Git clones/ref mirrors
 - `--daemon` double-forks to background and redirects stdio to `/dev/null`
 
 For repos with `checkout_on_sync = true` or `checkout_pr_branches = true`: if the local clone
-is missing, `gh repo clone` runs once. Otherwise the watch loop runs `git fetch origin` once
-per repo per cycle, but only when that repo had activity this cycle (any PushEvent,
-PullRequestEvent, or other /events row). HEAD is never touched -- the local working tree is
-left alone. Use `ghcache checkout <repo> <branch>` for an explicit reset.
+is missing, `gh repo clone` runs once. Existing clones fetch origin. Clean worktrees on the
+configured default branch use `git pull --ff-only`; dirty worktrees or non-default branches
+only fetch. With `checkout_pr_branches = true`, watch also fetches:
+
+```sh
+git fetch --prune origin '+refs/pull/*/head:refs/remotes/pr/*/head'
+```
+
+This mirrors GitHub PR heads into local `refs/remotes/pr/<number>/head` without spending REST
+or GraphQL budget.
 
 Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below).
 

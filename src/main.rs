@@ -101,14 +101,15 @@ enum Cmd {
         Each iteration is event-targeted: only PRs mentioned in GitHub event payloads \
         are re-fetched via GraphQL. Full-sweep PR queries are batched (up to 20 repos \
         per GraphQL call) to minimize API consumption. Most polls are free 304 responses.\n\n\
-        Repos with checkout_on_sync or checkout_pr_branches = true get a single `git fetch \
-        origin` per cycle, but only when that repo had activity (any event this pass). If the \
-        local clone is missing, gh repo clone runs once. HEAD is never touched -- use `ghcache \
-        checkout` for an explicit reset.\n\n\
+        Repos with checkout_on_sync or checkout_pr_branches = true update local clones after \
+        each sync pass. Clean worktrees on the default branch use `git pull --ff-only`; dirty \
+        worktrees or non-default branches use `git fetch origin`. checkout_pr_branches also \
+        mirrors `refs/pull/*/head` into local `refs/remotes/pr/*/head`.\n\n\
         Also starts the HTTP command server on 127.0.0.1:{cmd_port} (default 7748).\n\
         Endpoints: GET /events (SSE), POST /subscribe, POST /heartbeat, POST /pause, POST /resume.\n\n\
         --full-sweep: force a full PR re-fetch on startup even if data is cached.\n\
         --no-sync: start the HTTP server only; skip the sync loop entirely.\n\
+        --local-git-only: skip GitHub API sync and only update local Git clones/ref mirrors.\n\
         --daemon: double-fork to background, redirect stdio to /dev/null. \
         A pidfile is written next to the database (gh.pid) and checked on startup \
         to prevent duplicate instances.")]
@@ -122,6 +123,9 @@ enum Cmd {
         /// Force a full sweep on startup even if data is cached
         #[arg(long)]
         full_sweep: bool,
+        /// Skip GitHub API sync; only update local Git clones and PR refs
+        #[arg(long)]
+        local_git_only: bool,
     },
     /// Query cached data
     Query {
@@ -199,7 +203,7 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
             let filter = sync::SyncFilter { repo, prs_only: prs, notifs_only: notifications, events_only: events };
             sync::run(&pool, &gh, &cfg, filter, true, &[], &[], &username).await.map(|_| ())
         }
-        Cmd::Watch { daemon: _, no_sync, full_sweep } => {
+        Cmd::Watch { daemon: _, no_sync, full_sweep, local_git_only } => {
             let pid_path = cfg.db_path.with_extension("pid");
             let _pid = pidfile::PidFile::acquire(&pid_path)?;
             let pool = db::open(&cfg.db_path).await?;
@@ -224,7 +228,7 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
                 tracing::info!("--no-sync: HTTP server running, sync loop disabled");
                 loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
             }
-            sync::watch(&pool, &gh, &cfg, subs, paused, full_sweep).await
+            sync::watch(&pool, &gh, &cfg, subs, paused, full_sweep, local_git_only).await
         }
         Cmd::Query { sub } => {
             let pool = db::open(&cfg.db_path).await?;

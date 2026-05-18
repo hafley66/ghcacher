@@ -13,6 +13,8 @@ pub struct CheckoutTask {
     pub is_dirty: bool,
     /// The default branch for this repo as known by the DB (e.g. "main").
     pub default_branch: String,
+    /// Mirror GitHub pull request heads into refs/remotes/pr/<number>/head.
+    pub fetch_pr_branches: bool,
 }
 
 /// CLI-driven explicit checkout: clone if missing, fetch, reset HEAD to `branch`.
@@ -60,22 +62,35 @@ pub async fn checkout_all(
         let fs_owner = t.fs_owner.clone();
         let is_dirty = t.is_dirty;
         let default_branch = t.default_branch.clone();
+        let fetch_pr_branches = t.fetch_pr_branches;
         let slug = format!("{owner}/{name}");
         handles.push(tokio::spawn(async move {
             let local_path = staging.join(&fs_owner).join(&name);
             let res = if !local_path.exists() {
+                tracing::info!(%slug, path = %local_path.display(), "checkout: cloning");
                 run_clone(&slug, &local_path).await
             } else if is_dirty {
                 match should_pull(&local_path, &default_branch).await {
-                    Ok(true) => run_pull(&local_path).await,
-                    Ok(false) => run_fetch(&local_path).await,
+                    Ok(true) => {
+                        tracing::info!(%slug, path = %local_path.display(), branch = %default_branch, "checkout: pulling");
+                        run_pull(&local_path).await
+                    }
+                    Ok(false) => {
+                        tracing::info!(%slug, path = %local_path.display(), "checkout: fetching");
+                        run_fetch(&local_path).await
+                    }
                     Err(e) => {
                         tracing::warn!(%slug, error = %e, "could not determine pull eligibility, falling back to fetch");
                         run_fetch(&local_path).await
                     }
                 }
             } else {
+                tracing::info!(%slug, path = %local_path.display(), "checkout: fetching");
                 run_fetch(&local_path).await
+            };
+            let res = match res {
+                Ok(()) if fetch_pr_branches => run_fetch_pr_heads(&local_path).await,
+                other => other,
             };
             (slug, res)
         }));
@@ -178,6 +193,20 @@ async fn run_fetch(path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn run_fetch_pr_heads(path: &Path) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    let status = Command::new("git")
+        .args(["-C", &path_str, "fetch", "--prune", "origin", "+refs/pull/*/head:refs/remotes/pr/*/head"])
+        .status()
+        .await
+        .context("git fetch pull request heads")?;
+    if !status.success() {
+        bail!("git fetch pull request heads failed in {}", path.display());
+    }
+    tracing::info!(path = %path.display(), "fetched pull request heads");
+    Ok(())
+}
+
 async fn run_pull(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy();
     let status = Command::new("git")
@@ -188,7 +217,7 @@ async fn run_pull(path: &Path) -> Result<()> {
     if !status.success() {
         bail!("git pull --ff-only failed in {}", path.display());
     }
-    tracing::info!(path = %path.display(), "pulled origin --ff-only");
+    tracing::info!(path = %path.display(), "pulled");
     Ok(())
 }
 
@@ -238,6 +267,11 @@ mod tests {
         let out = git_cmd(path, &["rev-parse", rev]).await;
         assert!(out.status.success(), "git rev-parse {rev} failed");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    async fn git_rev_parse_opt(path: &Path, rev: &str) -> Option<String> {
+        let out = git_cmd(path, &["rev-parse", rev]).await;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     /// Push a new file to `origin` from a fresh clone living in `tmp/clone2`.
@@ -304,6 +338,7 @@ mod tests {
             fs_owner: "o".into(),
             is_dirty: true,
             default_branch: "main".into(),
+            fetch_pr_branches: false,
         };
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
@@ -331,6 +366,7 @@ mod tests {
             fs_owner: ".".into(),
             is_dirty: true,
             default_branch: "main".into(),
+            fetch_pr_branches: false,
         };
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
@@ -358,6 +394,7 @@ mod tests {
             fs_owner: ".".into(),
             is_dirty: true,
             default_branch: "main".into(),
+            fetch_pr_branches: false,
         };
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
@@ -386,6 +423,7 @@ mod tests {
             fs_owner: ".".into(),
             is_dirty: true,
             default_branch: "main".into(),
+            fetch_pr_branches: false,
         };
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
@@ -413,6 +451,7 @@ mod tests {
             fs_owner: ".".into(),
             is_dirty: true,
             default_branch: "main".into(),
+            fetch_pr_branches: false,
         };
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
@@ -439,6 +478,7 @@ mod tests {
             fs_owner: ".".into(),
             is_dirty: false,
             default_branch: "main".into(),
+            fetch_pr_branches: false,
         };
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
@@ -466,11 +506,72 @@ mod tests {
             fs_owner: "o".into(),
             is_dirty: false,
             default_branch: "main".into(),
+            fetch_pr_branches: false,
         };
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
         let after = git_rev_parse(&clone, "origin/main").await;
         assert_ne!(before, after, "origin/main must advance even when not dirty");
+    }
+
+    #[tokio::test]
+    async fn fetches_pull_request_heads_into_pr_remote_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let clone = tmp.path().join("o").join("n");
+        tokio::fs::create_dir_all(clone.parent().unwrap()).await.unwrap();
+        setup_origin_and_clone(&origin, &clone).await;
+        push_new_commit_to_origin(tmp.path(), &origin, "pr.txt", "pr").await;
+        let pr_sha = git_rev_parse(&origin, "refs/heads/main").await;
+        git_ok(&origin, &["update-ref", "refs/pull/17/head", &pr_sha]).await;
+
+        let task = CheckoutTask {
+            owner: "o".into(),
+            name: "n".into(),
+            fs_owner: "o".into(),
+            is_dirty: false,
+            default_branch: "main".into(),
+            fetch_pr_branches: true,
+        };
+        checkout_all(tmp.path(), &[task]).await.unwrap();
+
+        let fetched = git_rev_parse(&clone, "refs/remotes/pr/17/head").await;
+        assert_eq!(fetched, pr_sha);
+    }
+
+    #[tokio::test]
+    async fn prunes_deleted_pull_request_heads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let clone = tmp.path().join("o").join("n");
+        tokio::fs::create_dir_all(clone.parent().unwrap()).await.unwrap();
+        setup_origin_and_clone(&origin, &clone).await;
+        let pr_sha = git_rev_parse(&origin, "refs/heads/main").await;
+        git_ok(&origin, &["update-ref", "refs/pull/17/head", &pr_sha]).await;
+
+        let task = CheckoutTask {
+            owner: "o".into(),
+            name: "n".into(),
+            fs_owner: "o".into(),
+            is_dirty: false,
+            default_branch: "main".into(),
+            fetch_pr_branches: true,
+        };
+        checkout_all(tmp.path(), &[task]).await.unwrap();
+        assert!(git_rev_parse_opt(&clone, "refs/remotes/pr/17/head").await.is_some());
+
+        git_ok(&origin, &["update-ref", "-d", "refs/pull/17/head"]).await;
+        let task = CheckoutTask {
+            owner: "o".into(),
+            name: "n".into(),
+            fs_owner: "o".into(),
+            is_dirty: false,
+            default_branch: "main".into(),
+            fetch_pr_branches: true,
+        };
+        checkout_all(tmp.path(), &[task]).await.unwrap();
+
+        assert!(git_rev_parse_opt(&clone, "refs/remotes/pr/17/head").await.is_none());
     }
 
     #[tokio::test]

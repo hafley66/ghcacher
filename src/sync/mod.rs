@@ -297,7 +297,7 @@ pub async fn build_checkout_tasks(
         if !wants_on_sync && !wants_pr_fetch { continue; }
         let default_branch = match db::get_repo_default_branch(&mut *conn, &r.owner, &r.name).await {
             Ok(Some(b)) => b,
-            _ => continue,
+            _ => r.default_branch.clone().unwrap_or_else(|| "main".into()),
         };
         let is_dirty = dirty_repos.contains(&(r.owner.clone(), r.name.clone()));
         tasks.push(checkout::CheckoutTask {
@@ -306,6 +306,7 @@ pub async fn build_checkout_tasks(
             fs_owner: r.fs_owner().to_owned(),
             is_dirty,
             default_branch,
+            fetch_pr_branches: wants_pr_fetch,
         });
     }
 
@@ -328,6 +329,7 @@ pub async fn build_checkout_tasks(
                 fs_owner: org.fs_owner().to_owned(),
                 is_dirty,
                 default_branch,
+                fetch_pr_branches: wants_pr_fetch,
             });
         }
     }
@@ -359,9 +361,14 @@ pub async fn watch(
     subs: Option<std::sync::Arc<crate::cmd::Subscriptions>>,
     paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     force_full_sweep: bool,
+    local_git_only: bool,
 ) -> Result<()> {
     tracing::info!("starting watch loop");
-    let gh_username = gh::authenticated_username(&cfg.gh_binary).await?;
+    let gh_username = if local_git_only {
+        String::new()
+    } else {
+        gh::authenticated_username(&cfg.gh_binary).await?
+    };
     let mut first_run = if force_full_sweep {
         true
     } else {
@@ -418,11 +425,15 @@ pub async fn watch(
             tracing::debug!(count = extra_repos.len(), "syncing subscription repos");
         }
 
-        let dirty_repos = match run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs, &gh_username).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(error = %e, "watch sync error");
-                HashSet::new()
+        let dirty_repos = if local_git_only {
+            configured_checkout_repos(pool, cfg, &extra_repos).await
+        } else {
+            match run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs, &gh_username).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!(error = %e, "watch sync error");
+                    HashSet::new()
+                }
             }
         };
         first_run = false;
@@ -448,6 +459,33 @@ pub async fn watch(
             tokio::time::sleep(Duration::from_secs(interval)).await;
         }
     }
+}
+
+async fn configured_checkout_repos(
+    pool: &SqlitePool,
+    cfg: &ResolvedConfig,
+    extra_repos: &[RepoConfig],
+) -> HashSet<(String, String)> {
+    let mut out = HashSet::new();
+    for r in cfg.repos.iter().chain(extra_repos.iter()) {
+        if r.checkout_on_sync.unwrap_or(false) || r.checkout_pr_branches.unwrap_or(false) {
+            out.insert((r.owner.clone(), r.name.clone()));
+        }
+    }
+    for org in &cfg.orgs {
+        if !org.checkout_on_sync.unwrap_or(false) && !org.checkout_pr_branches.unwrap_or(false) {
+            continue;
+        }
+        let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM repo WHERE owner = ?")
+            .bind(&org.owner)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        for name in rows {
+            out.insert((org.owner.clone(), name));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -694,6 +732,24 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty, &[]).await;
         assert_eq!(tasks.len(), 0, "repos without checkout_* flags must not be tasked");
+    }
+
+    #[tokio::test]
+    async fn configured_repo_checkout_task_uses_config_default_branch_without_db_row() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mut cfg = cfg_with_repo("o", "n");
+        cfg.repos[0].checkout_on_sync = Some(true);
+        cfg.repos[0].default_branch = Some("trunk".into());
+
+        let mut dirty = HashSet::new();
+        dirty.insert(("o".to_string(), "n".to_string()));
+
+        let mut conn = pool.acquire().await.unwrap();
+        let tasks = build_checkout_tasks(&mut *conn, &cfg, &dirty, &[]).await;
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].default_branch, "trunk");
+        assert!(tasks[0].is_dirty);
     }
 
     #[tokio::test]
