@@ -425,29 +425,27 @@ pub async fn watch(
             tracing::debug!(count = extra_repos.len(), "syncing subscription repos");
         }
 
-        let dirty_repos = if local_git_only {
-            configured_checkout_repos(pool, cfg, &extra_repos).await
-        } else {
-            match run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs, &gh_username).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!(error = %e, "watch sync error");
-                    HashSet::new()
-                }
-            }
-        };
-        first_run = false;
-
-        // Checkout tasks: one per repo, gated by in-memory dirty signal.
         {
+            let checkout_repos = configured_checkout_repos(pool, cfg, &extra_repos).await;
             let mut conn = pool.acquire().await?;
-            let tasks = build_checkout_tasks(&mut *conn, cfg, &dirty_repos, &extra_repos).await;
+            let tasks = build_checkout_tasks(&mut *conn, cfg, &checkout_repos, &extra_repos).await;
             if !tasks.is_empty() {
+                tracing::info!(count = tasks.len(), "checkout: starting");
                 if let Err(e) = checkout::checkout_all(&cfg.staging_folder, &tasks).await {
                     tracing::error!(error = %e, "checkout_all failed");
                 }
             }
         }
+
+        if !local_git_only {
+            match run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs, &gh_username).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "watch sync error");
+                }
+            }
+        }
+        first_run = false;
 
         let interval = cfg.poll_interval_seconds;
         tracing::debug!(sleep_seconds = interval, "watch sleeping");
