@@ -43,13 +43,12 @@ pub async fn checkout_one(
     run_reset(&local_path, branch).await
 }
 
-/// Watch-driven checkout sweep: clone missing dirs, fetch origin for dirty repos,
-/// or pull when on the default branch with a clean working tree.
+/// Watch-driven checkout sweep: clone missing dirs, pull when on the default
+/// branch with a clean working tree, fetch otherwise.
 ///
 /// Decision matrix for an existing clone:
-/// - is_dirty == false          -> skip
-/// - is_dirty == true + on default branch + working tree clean -> git pull
-/// - is_dirty == true + otherwise                              -> git fetch origin
+/// - on default branch + working tree clean -> git pull
+/// - otherwise                              -> git fetch origin
 pub async fn checkout_all(
     staging: &Path,
     tasks: &[CheckoutTask],
@@ -60,7 +59,6 @@ pub async fn checkout_all(
         let owner = t.owner.clone();
         let name = t.name.clone();
         let fs_owner = t.fs_owner.clone();
-        let is_dirty = t.is_dirty;
         let default_branch = t.default_branch.clone();
         let fetch_pr_branches = t.fetch_pr_branches;
         let slug = format!("{owner}/{name}");
@@ -69,7 +67,7 @@ pub async fn checkout_all(
             let res = if !local_path.exists() {
                 tracing::info!(%slug, path = %local_path.display(), "checkout: cloning");
                 run_clone(&slug, &local_path).await
-            } else if is_dirty {
+            } else {
                 match should_pull(&local_path, &default_branch).await {
                     Ok(true) => {
                         tracing::info!(%slug, path = %local_path.display(), branch = %default_branch, "checkout: pulling");
@@ -84,9 +82,6 @@ pub async fn checkout_all(
                         run_fetch(&local_path).await
                     }
                 }
-            } else {
-                tracing::info!(%slug, path = %local_path.display(), "checkout: fetching");
-                run_fetch(&local_path).await
             };
             let res = match res {
                 Ok(()) if fetch_pr_branches => run_fetch_pr_heads(&local_path).await,
@@ -463,7 +458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_happens_even_when_not_dirty() {
+    async fn pull_happens_even_when_not_dirty() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -484,13 +479,13 @@ mod tests {
 
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
-        assert_eq!(before, after, "must not touch local HEAD when not dirty");
-        assert_ne!(before, origin_main, "must still fetch origin even when not dirty");
-        assert!(!clone.join("new.txt").exists(), "new file must not appear after fetch-only");
+        assert_ne!(before, after, "local HEAD must advance even when not dirty");
+        assert_eq!(after, origin_main, "pull must fast-forward to origin/main");
+        assert!(clone.join("new.txt").exists(), "new file must appear after pull");
     }
 
     #[tokio::test]
-    async fn fetch_always_happens_even_when_not_dirty() {
+    async fn pull_always_happens_even_when_not_dirty() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("o").join("n");
@@ -512,6 +507,7 @@ mod tests {
 
         let after = git_rev_parse(&clone, "origin/main").await;
         assert_ne!(before, after, "origin/main must advance even when not dirty");
+        assert_eq!(git_rev_parse(&clone, "HEAD").await, after, "HEAD must advance when clean on default branch");
     }
 
     #[tokio::test]
