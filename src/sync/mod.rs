@@ -44,18 +44,21 @@ async fn discover_org_repos(
     conn: &mut sqlx::SqliteConnection,
     gh: &dyn GitHubClient,
     owner: &str,
+    interval_seconds: u64,
+    force: bool,
 ) -> Result<Vec<(String, Option<String>)>> {
     let org_endpoint  = format!("/orgs/{owner}/repos?per_page=100");
     let user_endpoint = format!("/users/{owner}/repos?per_page=100");
 
     let poll = db::get_poll_state(conn, &org_endpoint).await?;
 
-    // Repo lists change rarely. Skip the API call if polled in the last 24 hours.
-    if let Some(ref ts) = poll.last_polled_at {
-        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(ts) {
-            if chrono::Utc::now().signed_duration_since(last) < chrono::Duration::hours(24) {
-                tracing::debug!(owner, "org repo list polled <24h ago, using DB cache");
-                return repos_from_db(conn, owner).await;
+    if !force && interval_seconds > 0 {
+        if let Some(ref ts) = poll.last_polled_at {
+            if let Ok(last) = chrono::DateTime::parse_from_rfc3339(ts) {
+                if chrono::Utc::now().signed_duration_since(last) < chrono::Duration::seconds(interval_seconds as i64) {
+                    tracing::debug!(owner, interval_seconds, "org repo list poll interval not elapsed, using DB cache");
+                    return repos_from_db(conn, owner).await;
+                }
             }
         }
     }
@@ -137,13 +140,33 @@ pub async fn run(
     extra_notif_slugs: &[(String, String)],
     gh_username: &str,
 ) -> Result<HashSet<(String, String)>> {
+    run_with_repo_discovery(pool, gh, cfg, filter, full_sweep, extra_repos, extra_notif_slugs, gh_username, true).await
+}
+
+async fn run_with_repo_discovery(
+    pool: &SqlitePool,
+    gh: &dyn GitHubClient,
+    cfg: &ResolvedConfig,
+    filter: SyncFilter,
+    full_sweep: bool,
+    extra_repos: &[RepoConfig],
+    extra_notif_slugs: &[(String, String)],
+    gh_username: &str,
+    force_org_repo_discovery: bool,
+) -> Result<HashSet<(String, String)>> {
     let mut dirty_repos: HashSet<(String, String)> = HashSet::new();
     let mut org_repos: Vec<RepoConfig> = vec![];
     let mut org_owners: HashSet<String> = HashSet::new();
     {
         let mut conn = pool.acquire().await?;
         for org in &cfg.orgs {
-            match discover_org_repos(&mut *conn, gh, &org.owner).await {
+            match discover_org_repos(
+                &mut *conn,
+                gh,
+                &org.owner,
+                cfg.org_repo_discovery_interval_seconds,
+                force_org_repo_discovery,
+            ).await {
                 Ok(names) => {
                     org_owners.insert(org.owner.clone());
                     org_repos.extend(org_to_repos(org, names));
@@ -438,7 +461,7 @@ pub async fn watch(
         }
 
         if !local_git_only {
-            match run(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs, &gh_username).await {
+            match run_with_repo_discovery(pool, gh, cfg, filter, first_run, &extra_repos, &extra_notif_slugs, &gh_username, first_run).await {
                 Ok(_) => {}
                 Err(e) => {
                     tracing::error!(error = %e, "watch sync error");
@@ -498,6 +521,7 @@ mod tests {
             db_path:               std::path::PathBuf::from(":memory:"),
             staging_folder:        std::path::PathBuf::from("/tmp"),
             poll_interval_seconds: 60,
+            org_repo_discovery_interval_seconds: 3600,
             log_level:             "info".into(),
             gh_binary:             "gh".into(),
             rate_warn_threshold:   500,
@@ -587,6 +611,7 @@ mod tests {
             db_path:               std::path::PathBuf::from(":memory:"),
             staging_folder:        std::path::PathBuf::from("/tmp"),
             poll_interval_seconds: 60,
+            org_repo_discovery_interval_seconds: 3600,
             log_level:             "info".into(),
             gh_binary:             "gh".into(),
             rate_warn_threshold:   500,
@@ -614,6 +639,23 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let id = db::get_repo_id(&mut *conn, "o", "r").await.unwrap();
         assert!(id.is_some(), "new org repo must be upserted even with no activity");
+    }
+
+    #[tokio::test]
+    async fn org_repo_discovery_interval_skips_until_forced() {
+        let pool = db::open_in_memory().await.unwrap();
+        let mock = MockGhClient::new();
+        mock.push_rest(serde_json::json!([{"name": "fresh"}]));
+
+        let mut conn = pool.acquire().await.unwrap();
+        db::upsert_repo(&mut *conn, "o", "cached", "main").await.unwrap();
+        db::set_poll_state(&mut *conn, "/orgs/o/repos?per_page=100", Some("etag"), None, None, false).await.unwrap();
+
+        let cached = discover_org_repos(&mut *conn, &mock, "o", 3600, false).await.unwrap();
+        assert_eq!(cached, vec![("cached".to_string(), Some("main".to_string()))]);
+
+        let fresh = discover_org_repos(&mut *conn, &mock, "o", 3600, true).await.unwrap();
+        assert_eq!(fresh, vec![("fresh".to_string(), None)]);
     }
 
     #[tokio::test]
@@ -799,6 +841,7 @@ mod tests {
             db_path: std::path::PathBuf::from(":memory:"),
             staging_folder: std::path::PathBuf::from("/tmp"),
             poll_interval_seconds: 60,
+            org_repo_discovery_interval_seconds: 3600,
             log_level: "info".into(),
             gh_binary: "gh".into(),
             rate_warn_threshold: 500,
@@ -891,6 +934,7 @@ mod tests {
             db_path: std::path::PathBuf::from(":memory:"),
             staging_folder: std::path::PathBuf::from("/tmp"),
             poll_interval_seconds: 60,
+            org_repo_discovery_interval_seconds: 3600,
             log_level: "info".into(),
             gh_binary: "gh".into(),
             rate_warn_threshold: 500,
@@ -992,6 +1036,7 @@ mod integration {
             db_path:               tmp.join("test.db"),
             staging_folder:        tmp.to_path_buf(),
             poll_interval_seconds: 60,
+            org_repo_discovery_interval_seconds: 3600,
             log_level:             "warn".into(),
             gh_binary:             "gh".into(),
             rate_warn_threshold:   500,

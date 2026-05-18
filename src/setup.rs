@@ -136,6 +136,7 @@ fn generate_toml(
         out.push_str(&format!("staging_folder        = \"{staging_folder}\"\n"));
     }
     out.push_str("poll_interval_seconds = 60\n");
+    out.push_str("org_repo_discovery_interval_seconds = 3600\n");
     out.push_str("log_level             = \"info\"\n");
     out.push_str("gh_binary             = \"gh\"\n");
 

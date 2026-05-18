@@ -248,6 +248,7 @@ fn cmd_init() -> Result<()> {
 db_path               = "~/.local/share/ghcache/gh.db"
 staging_folder        = "~/.local/share/ghcache/repos"
 poll_interval_seconds = 60
+org_repo_discovery_interval_seconds = 3600
 log_level             = "info"
 gh_binary             = "gh"
 
@@ -289,6 +290,7 @@ fn cmd_config(cfg: &config::ResolvedConfig) -> Result<()> {
     println!("db_path:          {}", cfg.db_path.display());
     println!("staging_folder:   {}", cfg.staging_folder.display());
     println!("poll_interval:    {}s", cfg.poll_interval_seconds);
+    println!("org_repo_discovery_interval: {}s", cfg.org_repo_discovery_interval_seconds);
     println!("log_level:        {}", cfg.log_level);
     println!("gh_binary:        {}", cfg.gh_binary);
     println!("repos ({}):", cfg.repos.len());

@@ -146,6 +146,7 @@ rm /tmp/ghcache-demo.toml /tmp/ghcache-demo.db
 db_path              = "~/.local/share/ghcache/gh.db"
 staging_folder       = "~/.local/share/ghcache/repos"  # git checkouts live here, next to the DB
 poll_interval_seconds = 60
+org_repo_discovery_interval_seconds = 3600  # repo-list discovery cadence; 0 = every sync pass
 log_level            = "info"            # trace | debug | info | warn | error
 gh_binary            = "gh"
 sync_notifications   = false             # sync the authenticated user's personal notification inbox
@@ -260,7 +261,8 @@ previous run. Subsequent iterations are event-targeted: org repos with no new ev
 last pass are skipped entirely (no API calls, no transaction). Only repos with activity get
 their PRs and branches re-fetched. Most polls are free 304 responses.
 
-Org repo discovery is cached for 24 hours between API calls.
+Org repo discovery runs on watch startup, then uses `org_repo_discovery_interval_seconds`
+between API calls. The default is `3600` seconds.
 
 - `--full-sweep` forces a complete PR re-fetch on startup even if data is cached
 - `--no-sync` starts the HTTP server only, with no sync loop
@@ -363,6 +365,7 @@ data: {"id":42,"entity_type":"pull_request","entity_id":7,"event":"updated","rep
 [global]
 cmd_port              = 7748   # HTTP server port (default 7748)
 heartbeat_ttl_seconds = 30     # subscription TTL in seconds (default 30)
+org_repo_discovery_interval_seconds = 3600  # repo-list discovery cadence; 0 = every sync pass
 ```
 
 ## Database

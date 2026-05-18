@@ -17,6 +17,8 @@ pub struct Global {
     pub db_path: Option<String>,
     pub staging_folder: Option<String>,
     pub poll_interval_seconds: Option<u64>,
+    /// Seconds between org/user repo-list discovery calls during watch (default 3600).
+    pub org_repo_discovery_interval_seconds: Option<u64>,
     pub log_level: Option<String>,
     pub gh_binary: Option<String>,
     /// REST + GraphQL remaining-calls count below which polling slows down (default 500).
@@ -37,6 +39,7 @@ impl Default for Global {
             db_path: None,
             staging_folder: None,
             poll_interval_seconds: Some(60),
+            org_repo_discovery_interval_seconds: Some(3600),
             log_level: Some("info".into()),
             gh_binary: Some("gh".into()),
             rate_warn_threshold: Some(500),
@@ -108,6 +111,7 @@ pub struct ResolvedConfig {
     pub db_path: PathBuf,
     pub staging_folder: PathBuf,
     pub poll_interval_seconds: u64,
+    pub org_repo_discovery_interval_seconds: u64,
     pub log_level: String,
     pub gh_binary: String,
     pub rate_warn_threshold: i64,
@@ -204,6 +208,7 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         db_path,
         staging_folder,
         poll_interval_seconds: config.global.poll_interval_seconds.unwrap_or(60),
+        org_repo_discovery_interval_seconds: config.global.org_repo_discovery_interval_seconds.unwrap_or(3600),
         log_level: config.global.log_level.unwrap_or_else(|| "info".into()),
         gh_binary: config.global.gh_binary.unwrap_or_else(|| "gh".into()),
         rate_warn_threshold: config.global.rate_warn_threshold.unwrap_or(500),
@@ -256,6 +261,7 @@ name = "backend"
         assert_eq!(cfg.repos[0].owner, "myorg");
         assert_eq!(cfg.repos[0].name, "backend");
         assert_eq!(cfg.db_path, PathBuf::from("/tmp/test.db"));
+        assert_eq!(cfg.org_repo_discovery_interval_seconds, 3600);
     }
 
     #[test]
@@ -329,6 +335,7 @@ name = "backend"
 db_path = "/tmp/test.db"
 staging_folder = "/tmp/ghcache_test_staging"
 poll_interval_seconds = 60
+org_repo_discovery_interval_seconds = 300
 
 [[repo]]
 owner = "myorg"
@@ -344,6 +351,7 @@ sync_prs = true
 "#,
         );
         let cfg = load(Some(f.path())).unwrap();
+        assert_eq!(cfg.org_repo_discovery_interval_seconds, 300);
         assert_eq!(cfg.repos.len(), 2);
         assert_eq!(cfg.repos[1].name, "frontend");
         assert_eq!(
