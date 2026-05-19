@@ -207,6 +207,25 @@ async fn git_rev_parse_opt(path: &Path, rev: &str) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
 }
 
+async fn git_pr_head_count(path: &Path) -> Result<usize> {
+    let output = Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "for-each-ref", "--format=%(refname)", "refs/remotes/pr"])
+        .output()
+        .await
+        .context("git for-each-ref refs/remotes/pr")?;
+    if !output.status.success() {
+        bail!(
+            "git for-each-ref refs/remotes/pr failed in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.ends_with("/head"))
+        .count())
+}
+
 fn short_sha(sha: Option<&str>) -> &str {
     sha.and_then(|s| s.get(..7)).unwrap_or("missing")
 }
@@ -260,6 +279,7 @@ async fn run_fetch_default_branch(path: &Path, branch: &str) -> Result<()> {
 
 async fn run_fetch_pr_heads(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy();
+    let before = git_pr_head_count(path).await?;
     let status = Command::new("git")
         .args(["-C", &path_str, "fetch", "--prune", "origin", "+refs/pull/*/head:refs/remotes/pr/*/head"])
         .status()
@@ -268,7 +288,16 @@ async fn run_fetch_pr_heads(path: &Path) -> Result<()> {
     if !status.success() {
         bail!("git fetch pull request heads failed in {}", path.display());
     }
-    tracing::info!(path = %path.display(), "fetched pull request heads");
+    let after = git_pr_head_count(path).await?;
+    let gone = before.saturating_sub(after);
+    tracing::info!(
+        path = %path.display(),
+        pr_heads_before = before,
+        pr_heads_after = after,
+        pr_heads_gone = gone,
+        pr_heads_present = after,
+        "fetched pull request heads"
+    );
     Ok(())
 }
 
@@ -662,6 +691,7 @@ mod tests {
 
         let fetched = git_rev_parse(&clone, "refs/remotes/pr/17/head").await;
         assert_eq!(fetched, pr_sha);
+        assert_eq!(git_pr_head_count(&clone).await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -697,6 +727,7 @@ mod tests {
         checkout_all(tmp.path(), &[task]).await.unwrap();
 
         assert!(git_rev_parse_opt(&clone, "refs/remotes/pr/17/head").await.is_none());
+        assert_eq!(git_pr_head_count(&clone).await.unwrap(), 0);
     }
 
     #[tokio::test]

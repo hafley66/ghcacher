@@ -290,7 +290,9 @@ Watch checkout logs include repo start/finish, current branch mode, stash events
 steps, and before/after SHA fields for the updated default branch.
 
 This mirrors GitHub PR heads into local `refs/remotes/pr/<number>/head` without spending REST
-or GraphQL budget.
+or GraphQL budget. Those refs are Git's copy of the PR head commits. They tell you which PR
+heads exist and what commit each points at, but not PR titles, authors, reviews, labels, or CI
+state. The fetch log includes `pr_heads_present` and `pr_heads_gone`.
 
 Also starts the HTTP command server on `127.0.0.1:{cmd_port}` (see below).
 
