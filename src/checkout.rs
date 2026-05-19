@@ -43,12 +43,14 @@ pub async fn checkout_one(
     run_reset(&local_path, branch).await
 }
 
-/// Watch-driven checkout sweep: clone missing dirs, pull when on the default
-/// branch with a clean working tree, fetch otherwise.
+/// Watch-driven checkout sweep: clone missing dirs and force-update the default
+/// branch. If the default branch is checked out, local changes are stashed before
+/// resetting to origin/<default>. If another branch is checked out, that branch is
+/// left alone and the local default branch ref is force-updated in the background.
 ///
 /// Decision matrix for an existing clone:
-/// - on default branch + working tree clean -> git pull
-/// - otherwise                              -> git fetch origin
+/// - on default branch     -> stash if needed, fetch, reset --hard origin/default
+/// - on another branch     -> fetch, branch -f default origin/default
 pub async fn checkout_all(
     staging: &Path,
     tasks: &[CheckoutTask],
@@ -68,20 +70,7 @@ pub async fn checkout_all(
                 tracing::info!(%slug, path = %local_path.display(), "checkout: cloning");
                 run_clone(&slug, &local_path).await
             } else {
-                match should_pull(&local_path, &default_branch).await {
-                    Ok(true) => {
-                        tracing::info!(%slug, path = %local_path.display(), branch = %default_branch, "checkout: pulling");
-                        run_pull(&local_path).await
-                    }
-                    Ok(false) => {
-                        tracing::info!(%slug, path = %local_path.display(), "checkout: fetching");
-                        run_fetch(&local_path).await
-                    }
-                    Err(e) => {
-                        tracing::warn!(%slug, error = %e, "could not determine pull eligibility, falling back to fetch");
-                        run_fetch(&local_path).await
-                    }
-                }
+                force_update_default_branch(&slug, &local_path, &default_branch).await
             };
             let res = match res {
                 Ok(()) if fetch_pr_branches => run_fetch_pr_heads(&local_path).await,
@@ -99,27 +88,38 @@ pub async fn checkout_all(
     Ok(())
 }
 
-/// Returns true only when the current branch matches `default_branch` and the
-/// working tree has no modified, staged, or untracked files.
-async fn should_pull(path: &Path, default_branch: &str) -> Result<bool> {
+async fn force_update_default_branch(slug: &str, path: &Path, default_branch: &str) -> Result<()> {
     let current = git_current_branch(path).await?;
     if current != default_branch {
-        tracing::debug!(
+        tracing::info!(
+            %slug,
             path = %path.display(),
             current_branch = %current,
-            default_branch = %default_branch,
-            "not on default branch, will fetch"
+            branch = %default_branch,
+            "checkout: force-updating default branch in background"
         );
-        return Ok(false);
+        run_fetch_default_branch(path, default_branch).await?;
+        run_force_branch(path, default_branch).await?;
+        tracing::info!(%slug, path = %path.display(), branch = %default_branch, "default branch force-updated");
+        return Ok(());
     }
+
     let clean = git_working_tree_clean(path).await?;
     if !clean {
-        tracing::debug!(
+        tracing::info!(
+            %slug,
             path = %path.display(),
-            "working tree is not clean, will fetch"
+            branch = %default_branch,
+            "checkout: stashing before force update"
         );
+        run_stash(path, default_branch).await?;
     }
-    Ok(clean)
+
+    tracing::info!(%slug, path = %path.display(), branch = %default_branch, "checkout: force-updating checked-out default branch");
+    run_fetch_default_branch(path, default_branch).await?;
+    run_reset(path, default_branch).await?;
+    tracing::info!(%slug, path = %path.display(), branch = %default_branch, "default branch force-updated");
+    Ok(())
 }
 
 /// Empty output from `git status --porcelain` means nothing modified, staged, or untracked.
@@ -188,6 +188,21 @@ async fn run_fetch(path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn run_fetch_default_branch(path: &Path, branch: &str) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let status = Command::new("git")
+        .args(["-C", &path_str, "fetch", "origin", &refspec])
+        .status()
+        .await
+        .context("git fetch default branch")?;
+    if !status.success() {
+        bail!("git fetch origin {refspec} failed in {}", path.display());
+    }
+    tracing::info!(path = %path.display(), %branch, "fetched default branch");
+    Ok(())
+}
+
 async fn run_fetch_pr_heads(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy();
     let status = Command::new("git")
@@ -202,17 +217,18 @@ async fn run_fetch_pr_heads(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_pull(path: &Path) -> Result<()> {
+async fn run_stash(path: &Path, branch: &str) -> Result<()> {
     let path_str = path.to_string_lossy();
+    let message = format!("ghcache auto-stash before force-updating {branch}");
     let status = Command::new("git")
-        .args(["-C", &path_str, "pull", "--ff-only"])
+        .args(["-C", &path_str, "stash", "push", "--include-untracked", "-m", &message])
         .status()
         .await
-        .context("git pull --ff-only")?;
+        .context("git stash push")?;
     if !status.success() {
-        bail!("git pull --ff-only failed in {}", path.display());
+        bail!("git stash push failed in {}", path.display());
     }
-    tracing::info!(path = %path.display(), "pulled");
+    tracing::info!(path = %path.display(), %branch, "stashed worktree");
     Ok(())
 }
 
@@ -228,6 +244,21 @@ async fn run_reset(path: &Path, branch: &str) -> Result<()> {
         bail!("git reset --hard {remote_ref} failed in {}", path.display());
     }
     tracing::info!(path = %path.display(), %branch, "reset --hard to remote");
+    Ok(())
+}
+
+async fn run_force_branch(path: &Path, branch: &str) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    let remote_ref = format!("origin/{branch}");
+    let status = Command::new("git")
+        .args(["-C", &path_str, "branch", "-f", branch, &remote_ref])
+        .status()
+        .await
+        .context("git branch -f")?;
+    if !status.success() {
+        bail!("git branch -f {branch} {remote_ref} failed in {}", path.display());
+    }
+    tracing::info!(path = %path.display(), %branch, "branch force-updated to remote");
     Ok(())
 }
 
@@ -267,6 +298,12 @@ mod tests {
     async fn git_rev_parse_opt(path: &Path, rev: &str) -> Option<String> {
         let out = git_cmd(path, &["rev-parse", rev]).await;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    async fn git_stash_list(path: &Path) -> String {
+        let out = git_cmd(path, &["stash", "list"]).await;
+        assert!(out.status.success(), "git stash list failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// Push a new file to `origin` from a fresh clone living in `tmp/clone2`.
@@ -314,7 +351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_fast_forwards_when_clean_on_default_branch() {
+    async fn force_update_fast_forwards_when_clean_on_default_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         // checkout_all expects staging/fs_owner/name
@@ -340,12 +377,12 @@ mod tests {
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
         assert_eq!(after, origin_main, "local main should fast-forward to origin");
-        assert_ne!(before, after, "HEAD should have moved after pull");
+        assert_ne!(before, after, "HEAD should have moved after force update");
         assert!(clone.join("new.txt").exists(), "new file should be present after fast-forward");
     }
 
     #[tokio::test]
-    async fn fetch_only_when_untracked_files_present() {
+    async fn stash_and_force_update_when_untracked_files_present_on_default_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -367,13 +404,14 @@ mod tests {
 
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
-        assert_ne!(before, origin_main, "origin should have advanced after fetch");
-        assert_eq!(before, after, "local HEAD must NOT move when untracked files block pull");
-        assert!(!clone.join("new.txt").exists(), "new file must not appear after fetch-only");
+        assert_ne!(before, after, "local HEAD must move after force update");
+        assert_eq!(after, origin_main, "local HEAD must reset to origin/main");
+        assert!(clone.join("new.txt").exists(), "new file must appear after force update");
+        assert!(git_stash_list(&clone).await.contains("ghcache auto-stash"));
     }
 
     #[tokio::test]
-    async fn fetch_only_when_modified_files_present() {
+    async fn stash_and_force_update_when_modified_files_present_on_default_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -395,13 +433,14 @@ mod tests {
 
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
-        assert_ne!(before, origin_main, "origin should have advanced after fetch");
-        assert_eq!(before, after, "local HEAD must NOT move when modified files block pull");
-        assert!(!clone.join("new.txt").exists(), "new file must not appear after fetch-only");
+        assert_ne!(before, after, "local HEAD must move after force update");
+        assert_eq!(after, origin_main, "local HEAD must reset to origin/main");
+        assert!(clone.join("new.txt").exists(), "new file must appear after force update");
+        assert!(git_stash_list(&clone).await.contains("ghcache auto-stash"));
     }
 
     #[tokio::test]
-    async fn fetch_only_when_staged_files_present() {
+    async fn stash_and_force_update_when_staged_files_present_on_default_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -424,13 +463,14 @@ mod tests {
 
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
-        assert_ne!(before, origin_main, "origin should have advanced after fetch");
-        assert_eq!(before, after, "local HEAD must NOT move when staged files block pull");
-        assert!(!clone.join("new.txt").exists(), "new file must not appear after fetch-only");
+        assert_ne!(before, after, "local HEAD must move after force update");
+        assert_eq!(after, origin_main, "local HEAD must reset to origin/main");
+        assert!(clone.join("new.txt").exists(), "new file must appear after force update");
+        assert!(git_stash_list(&clone).await.contains("ghcache auto-stash"));
     }
 
     #[tokio::test]
-    async fn fetch_only_when_on_non_default_branch() {
+    async fn force_update_default_branch_without_switching_feature_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -452,13 +492,47 @@ mod tests {
 
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
+        let local_main = git_rev_parse(&clone, "main").await;
         assert_ne!(before, origin_main, "origin should have advanced after fetch");
-        assert_eq!(before, after, "local HEAD must NOT move when on a feature branch");
-        assert!(!clone.join("new.txt").exists(), "new file must not appear after fetch-only");
+        assert_eq!(before, after, "local HEAD must not move when on a feature branch");
+        assert_eq!(local_main, origin_main, "local main must update in the background");
+        assert!(!clone.join("new.txt").exists(), "feature worktree must not receive main files");
     }
 
     #[tokio::test]
-    async fn pull_happens_even_when_not_dirty() {
+    async fn force_update_handles_non_fast_forward_default_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let clone = tmp.path().join("clone");
+        setup_origin_and_clone(&origin, &clone).await;
+
+        tokio::fs::write(clone.join("local.txt"), "local").await.unwrap();
+        git_ok(&clone, &["add", "local.txt"]).await;
+        git_ok(&clone, &["commit", "-m", "local"]).await;
+        let local_commit = git_rev_parse(&clone, "HEAD").await;
+
+        push_new_commit_to_origin(tmp.path(), &origin, "remote.txt", "remote").await;
+
+        let task = CheckoutTask {
+            owner: "o".into(),
+            name: "clone".into(),
+            fs_owner: ".".into(),
+            is_dirty: false,
+            default_branch: "main".into(),
+            fetch_pr_branches: false,
+        };
+        checkout_all(tmp.path(), &[task]).await.unwrap();
+
+        let after = git_rev_parse(&clone, "HEAD").await;
+        let origin_main = git_rev_parse(&clone, "origin/main").await;
+        assert_ne!(local_commit, after, "local divergent commit must not remain checked out");
+        assert_eq!(after, origin_main, "local main must force-reset to origin/main");
+        assert!(clone.join("remote.txt").exists(), "remote file must appear after force update");
+        assert!(!clone.join("local.txt").exists(), "local divergent file must leave the worktree");
+    }
+
+    #[tokio::test]
+    async fn force_update_happens_even_when_not_dirty() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -480,12 +554,12 @@ mod tests {
         let after = git_rev_parse(&clone, "HEAD").await;
         let origin_main = git_rev_parse(&clone, "origin/main").await;
         assert_ne!(before, after, "local HEAD must advance even when not dirty");
-        assert_eq!(after, origin_main, "pull must fast-forward to origin/main");
-        assert!(clone.join("new.txt").exists(), "new file must appear after pull");
+        assert_eq!(after, origin_main, "force update must fast-forward to origin/main");
+        assert!(clone.join("new.txt").exists(), "new file must appear after force update");
     }
 
     #[tokio::test]
-    async fn pull_always_happens_even_when_not_dirty() {
+    async fn force_update_always_happens_even_when_not_dirty() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("o").join("n");
@@ -578,6 +652,5 @@ mod tests {
         setup_origin_and_clone(&origin, &clone).await;
 
         assert!(git_working_tree_clean(&clone).await.unwrap(), "fresh clone should be clean");
-        assert!(should_pull(&clone, "main").await.unwrap(), "clean + on main => should pull");
     }
 }

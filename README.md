@@ -270,9 +270,10 @@ between API calls. The default is `3600` seconds.
 - `--daemon` double-forks to background and redirects stdio to `/dev/null`
 
 For repos with `checkout_on_sync = true` or `checkout_pr_branches = true`: if the local clone
-is missing, `gh repo clone` runs once. Existing clones fetch origin. Clean worktrees on the
-configured default branch use `git pull --ff-only`; dirty worktrees or non-default branches
-only fetch. With `checkout_pr_branches = true`, watch also fetches:
+is missing, `gh repo clone` runs once. Existing clones force-update the configured default branch.
+If the default branch is checked out, local changes are stashed and the worktree is reset to
+`origin/<default>`. If another branch is checked out, that branch is left alone while the local
+default branch ref is force-updated in the background. With `checkout_pr_branches = true`, watch also fetches:
 
 ```sh
 git fetch --prune origin '+refs/pull/*/head:refs/remotes/pr/*/head'
@@ -449,8 +450,9 @@ All GitHub API access goes through the `gh` CLI binary (configurable via `gh_bin
 
 | Command | Purpose | Source Location |
 |---------|---------|-----------------|
-| `git -C <path> fetch origin <branch>` | Update existing checkout | `src/checkout.rs:188` |
-| `git -C <path> reset --hard FETCH_HEAD` | Reset to fetched SHA | `src/checkout.rs:195` |
+| `git -C <path> fetch origin +refs/heads/<branch>:refs/remotes/origin/<branch>` | Update default remote ref | `src/checkout.rs:188` |
+| `git -C <path> reset --hard origin/<branch>` | Reset checked-out default branch | `src/checkout.rs:195` |
+| `git -C <path> branch -f <branch> origin/<branch>` | Update local default branch while another branch is checked out | `src/checkout.rs:240` |
 | `git -C <path> fetch --all` | Fetch all refs (HTTP subscribe) | `src/cmd.rs:388` |
 
 ### HTTP Server
