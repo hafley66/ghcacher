@@ -66,6 +66,14 @@ pub async fn checkout_all(
         let slug = format!("{owner}/{name}");
         handles.push(tokio::spawn(async move {
             let local_path = staging.join(&fs_owner).join(&name);
+            tracing::info!(
+                %slug,
+                path = %local_path.display(),
+                branch = %default_branch,
+                fetch_pr_branches,
+                exists = local_path.exists(),
+                "checkout: repo start"
+            );
             let res = if !local_path.exists() {
                 tracing::info!(%slug, path = %local_path.display(), "checkout: cloning");
                 run_clone(&slug, &local_path).await
@@ -79,32 +87,47 @@ pub async fn checkout_all(
             (slug, res)
         }));
     }
+    let mut failed = 0usize;
     for h in handles {
         let (slug, res) = h.await.map_err(|_| anyhow!("checkout task panicked"))?;
         if let Err(e) = res {
+            failed += 1;
             tracing::error!(%slug, error = %e, "checkout: repo failed");
         }
     }
+    tracing::info!(total = tasks.len(), failed, "checkout: finished");
     Ok(())
 }
 
 async fn force_update_default_branch(slug: &str, path: &Path, default_branch: &str) -> Result<()> {
     let current = git_current_branch(path).await?;
     if current != default_branch {
+        let local_before = git_rev_parse_opt(path, default_branch).await?;
         tracing::info!(
             %slug,
             path = %path.display(),
             current_branch = %current,
             branch = %default_branch,
+            local_before = %short_sha(local_before.as_deref()),
             "checkout: force-updating default branch in background"
         );
         run_fetch_default_branch(path, default_branch).await?;
+        let remote_after = git_rev_parse_opt(path, &format!("origin/{default_branch}")).await?;
         run_force_branch(path, default_branch).await?;
-        tracing::info!(%slug, path = %path.display(), branch = %default_branch, "default branch force-updated");
+        let local_after = git_rev_parse_opt(path, default_branch).await?;
+        tracing::info!(
+            %slug,
+            path = %path.display(),
+            branch = %default_branch,
+            remote_after = %short_sha(remote_after.as_deref()),
+            local_after = %short_sha(local_after.as_deref()),
+            "default branch force-updated"
+        );
         return Ok(());
     }
 
     let clean = git_working_tree_clean(path).await?;
+    let head_before = git_rev_parse_opt(path, "HEAD").await?;
     if !clean {
         tracing::info!(
             %slug,
@@ -115,10 +138,26 @@ async fn force_update_default_branch(slug: &str, path: &Path, default_branch: &s
         run_stash(path, default_branch).await?;
     }
 
-    tracing::info!(%slug, path = %path.display(), branch = %default_branch, "checkout: force-updating checked-out default branch");
+    tracing::info!(
+        %slug,
+        path = %path.display(),
+        branch = %default_branch,
+        clean,
+        head_before = %short_sha(head_before.as_deref()),
+        "checkout: force-updating checked-out default branch"
+    );
     run_fetch_default_branch(path, default_branch).await?;
+    let remote_after = git_rev_parse_opt(path, &format!("origin/{default_branch}")).await?;
     run_reset(path, default_branch).await?;
-    tracing::info!(%slug, path = %path.display(), branch = %default_branch, "default branch force-updated");
+    let head_after = git_rev_parse_opt(path, "HEAD").await?;
+    tracing::info!(
+        %slug,
+        path = %path.display(),
+        branch = %default_branch,
+        remote_after = %short_sha(remote_after.as_deref()),
+        head_after = %short_sha(head_after.as_deref()),
+        "default branch force-updated"
+    );
     Ok(())
 }
 
@@ -154,6 +193,22 @@ async fn git_current_branch(path: &Path) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+async fn git_rev_parse_opt(path: &Path, rev: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "rev-parse", rev])
+        .output()
+        .await
+        .context("git rev-parse")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+}
+
+fn short_sha(sha: Option<&str>) -> &str {
+    sha.and_then(|s| s.get(..7)).unwrap_or("missing")
 }
 
 async fn run_clone(slug: &str, dest: &Path) -> Result<()> {

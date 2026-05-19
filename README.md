@@ -279,6 +279,16 @@ default branch ref is force-updated in the background. With `checkout_pr_branche
 git fetch --prune origin '+refs/pull/*/head:refs/remotes/pr/*/head'
 ```
 
+Checkout logs are emitted at `info`. Set `log_level = "debug"` for cache/poll decisions:
+
+```toml
+[global]
+log_level = "debug"
+```
+
+Watch checkout logs include repo start/finish, current branch mode, stash events, fetch/reset
+steps, and before/after SHA fields for the updated default branch.
+
 This mirrors GitHub PR heads into local `refs/remotes/pr/<number>/head` without spending REST
 or GraphQL budget.
 
