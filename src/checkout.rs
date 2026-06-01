@@ -1,7 +1,23 @@
 use anyhow::{anyhow, bail, Context, Result};
 use sqlx::SqlitePool;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
+
+/// Default cap on concurrent per-repo git operations during a checkout sweep.
+/// Override with `GHCACHE_CHECKOUT_CONCURRENCY`. Without this, a few-hundred-repo
+/// sweep spawns a few-hundred simultaneous `git fetch`/`gh clone` subprocesses
+/// and hogs the machine.
+const DEFAULT_CHECKOUT_CONCURRENCY: usize = 8;
+
+fn checkout_concurrency() -> usize {
+    std::env::var("GHCACHE_CHECKOUT_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_CHECKOUT_CONCURRENCY)
+}
 
 pub struct CheckoutTask {
     pub owner: String,
@@ -55,6 +71,9 @@ pub async fn checkout_all(
     staging: &Path,
     tasks: &[CheckoutTask],
 ) -> Result<()> {
+    let limit = checkout_concurrency();
+    let sem = Arc::new(Semaphore::new(limit));
+    tracing::info!(total = tasks.len(), concurrency = limit, "checkout: sweep starting");
     let mut handles: Vec<tokio::task::JoinHandle<(String, Result<()>)>> = vec![];
     for t in tasks {
         let staging = staging.to_path_buf();
@@ -64,7 +83,14 @@ pub async fn checkout_all(
         let default_branch = t.default_branch.clone();
         let fetch_pr_branches = t.fetch_pr_branches;
         let slug = format!("{owner}/{name}");
+        let sem = sem.clone();
         handles.push(tokio::spawn(async move {
+            // Park here until a permit frees up; caps concurrent git subprocesses
+            // at `limit` no matter how many repos are in the sweep.
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return (slug, Err(anyhow!("checkout semaphore closed"))),
+            };
             let local_path = staging.join(&fs_owner).join(&name);
             tracing::info!(
                 %slug,
@@ -161,7 +187,11 @@ async fn force_update_default_branch(slug: &str, path: &Path, default_branch: &s
     Ok(())
 }
 
-/// Empty output from `git status --porcelain` means nothing modified, staged, or untracked.
+/// Clean for force-update purposes means no *tracked* modifications or staged
+/// changes. Untracked files (`??`) and ignored files (`!!`) are deliberately
+/// ignored: `reset --hard` leaves untracked files in place, so there is nothing
+/// to stash for them. Only tracked diffs would be clobbered by the reset and
+/// thus need stashing first.
 async fn git_working_tree_clean(path: &Path) -> Result<bool> {
     let output = Command::new("git")
         .args(["-C", &path.to_string_lossy(), "status", "--porcelain"])
@@ -175,7 +205,11 @@ async fn git_working_tree_clean(path: &Path) -> Result<bool> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    Ok(output.stdout.is_empty())
+    let text = String::from_utf8_lossy(&output.stdout);
+    let has_tracked_changes = text
+        .lines()
+        .any(|l| !l.trim().is_empty() && !l.starts_with("??") && !l.starts_with("!!"));
+    Ok(!has_tracked_changes)
 }
 
 /// Returns the current branch name, or an empty string when in detached HEAD.
@@ -304,8 +338,11 @@ async fn run_fetch_pr_heads(path: &Path) -> Result<()> {
 async fn run_stash(path: &Path, branch: &str) -> Result<()> {
     let path_str = path.to_string_lossy();
     let message = format!("ghcache auto-stash before force-updating {branch}");
+    // No --include-untracked: untracked files survive a force update untouched.
+    // Only tracked modifications/staged changes (which reset --hard would clobber)
+    // are stashed here.
     let status = Command::new("git")
-        .args(["-C", &path_str, "stash", "push", "--include-untracked", "-m", &message])
+        .args(["-C", &path_str, "stash", "push", "-m", &message])
         .status()
         .await
         .context("git stash push")?;
@@ -466,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stash_and_force_update_when_untracked_files_present_on_default_branch() {
+    async fn untracked_files_survive_force_update_without_stashing() {
         let tmp = tempfile::tempdir().unwrap();
         let origin = tmp.path().join("origin.git");
         let clone = tmp.path().join("clone");
@@ -491,7 +528,10 @@ mod tests {
         assert_ne!(before, after, "local HEAD must move after force update");
         assert_eq!(after, origin_main, "local HEAD must reset to origin/main");
         assert!(clone.join("new.txt").exists(), "new file must appear after force update");
-        assert!(git_stash_list(&clone).await.contains("ghcache auto-stash"));
+        // Untracked files are left in place: reset --hard does not touch them and
+        // they must not be swept into a stash.
+        assert!(clone.join("untracked.txt").exists(), "untracked file must survive the force update");
+        assert_eq!(git_stash_list(&clone).await, "", "untracked-only dirt must not create a stash");
     }
 
     #[tokio::test]
@@ -738,5 +778,88 @@ mod tests {
         setup_origin_and_clone(&origin, &clone).await;
 
         assert!(git_working_tree_clean(&clone).await.unwrap(), "fresh clone should be clean");
+    }
+
+    #[test]
+    fn checkout_concurrency_defaults_and_parses_override() {
+        // Default when unset/invalid.
+        std::env::remove_var("GHCACHE_CHECKOUT_CONCURRENCY");
+        assert_eq!(checkout_concurrency(), DEFAULT_CHECKOUT_CONCURRENCY);
+
+        std::env::set_var("GHCACHE_CHECKOUT_CONCURRENCY", "0");
+        assert_eq!(checkout_concurrency(), DEFAULT_CHECKOUT_CONCURRENCY, "0 is rejected, falls back to default");
+
+        std::env::set_var("GHCACHE_CHECKOUT_CONCURRENCY", "nonsense");
+        assert_eq!(checkout_concurrency(), DEFAULT_CHECKOUT_CONCURRENCY, "garbage falls back to default");
+
+        std::env::set_var("GHCACHE_CHECKOUT_CONCURRENCY", "3");
+        assert_eq!(checkout_concurrency(), 3);
+
+        std::env::remove_var("GHCACHE_CHECKOUT_CONCURRENCY");
+    }
+
+    /// A pool of tasks gated by `Semaphore::new(2)` must never have more than 2
+    /// running at once. This is the exact mechanism `checkout_all` uses to cap
+    /// concurrent git subprocesses; the env wiring is covered by the parse test.
+    #[tokio::test]
+    async fn semaphore_caps_concurrent_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sem = Arc::new(Semaphore::new(2));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(0));
+        let mut handles = vec![];
+        for _ in 0..16 {
+            let sem = sem.clone();
+            let peak = peak.clone();
+            let live = live.clone();
+            handles.push(tokio::spawn(async move {
+                let _p = sem.acquire_owned().await.unwrap();
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                live.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles { h.await.unwrap(); }
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "peak concurrency {} exceeded cap 2",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A real sweep over several already-cloned repos completes successfully with
+    /// the cap in force (the default cap, no env override needed).
+    #[tokio::test]
+    async fn capped_sweep_updates_all_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let seed = tmp.path().join("seed");
+        setup_origin_and_clone(&origin, &seed).await;
+        push_new_commit_to_origin(tmp.path(), &origin, "new.txt", "new").await;
+
+        let mut tasks = vec![];
+        for i in 0..6 {
+            let fs_owner = format!("o{i}");
+            let dest = tmp.path().join(&fs_owner).join("n");
+            tokio::fs::create_dir_all(dest.parent().unwrap()).await.unwrap();
+            git_ok(tmp.path(), &["clone", origin.to_str().unwrap(), dest.to_str().unwrap()]).await;
+            tasks.push(CheckoutTask {
+                owner: "o".into(),
+                name: "n".into(),
+                fs_owner,
+                is_dirty: false,
+                default_branch: "main".into(),
+                fetch_pr_branches: false,
+            });
+        }
+
+        checkout_all(tmp.path(), &tasks).await.unwrap();
+
+        for i in 0..6 {
+            let dest = tmp.path().join(format!("o{i}")).join("n");
+            assert!(dest.join("new.txt").exists(), "repo o{i} must be updated to origin/main");
+        }
     }
 }

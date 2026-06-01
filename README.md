@@ -264,6 +264,12 @@ their PRs and branches re-fetched. Most polls are free 304 responses.
 Org repo discovery runs on watch startup, then uses `org_repo_discovery_interval_seconds`
 between API calls. The default is `3600` seconds.
 
+Each pass runs a checkout sweep over every `checkout_on_sync` repo, force-updating the
+default branch (clean reset on the default branch; `branch -f` in the background when a
+feature branch is checked out; untracked files are left in place, tracked edits are
+stashed first). The sweep caps concurrent git/`gh` subprocesses at `8` so a few-hundred-repo
+run does not thrash the machine; override with `GHCACHE_CHECKOUT_CONCURRENCY`.
+
 - `--full-sweep` forces a complete PR re-fetch on startup even if data is cached
 - `--no-sync` starts the HTTP server only, with no sync loop
 - `--local-git-only` skips GitHub REST/GraphQL sync and only updates local Git clones/ref mirrors
