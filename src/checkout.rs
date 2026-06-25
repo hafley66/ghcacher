@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 /// Override with `GHCACHE_CHECKOUT_CONCURRENCY`. Without this, a few-hundred-repo
 /// sweep spawns a few-hundred simultaneous `git fetch`/`gh clone` subprocesses
 /// and hogs the machine.
-const DEFAULT_CHECKOUT_CONCURRENCY: usize = 8;
+const DEFAULT_CHECKOUT_CONCURRENCY: usize = 4;
 
 fn checkout_concurrency() -> usize {
     std::env::var("GHCACHE_CHECKOUT_CONCURRENCY")
@@ -17,6 +17,48 @@ fn checkout_concurrency() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_CHECKOUT_CONCURRENCY)
+}
+
+/// Cap on git delta-resolution threads per fetch/clone subprocess. `index-pack`
+/// otherwise spins up one thread per core, so a single fetch can saturate the
+/// machine. Default 1; override with `GHCACHE_GIT_THREADS`.
+fn git_pack_threads() -> usize {
+    std::env::var("GHCACHE_GIT_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// `nice` increment for fetch/clone subprocesses so the sweep yields CPU to
+/// whatever the user is actively running. 0 disables the `nice` wrapper.
+/// Override with `GHCACHE_GIT_NICE`.
+fn git_niceness() -> i32 {
+    std::env::var("GHCACHE_GIT_NICE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(10)
+}
+
+/// Build a fetch/clone command tuned to stay calm under an active workload: delta
+/// threads capped via `GIT_CONFIG_*` (which also reaches the `git` that
+/// `gh repo clone` forks) and the process run at a lowered scheduling priority via
+/// `nice`. Read-only plumbing (status, rev-parse, ...) is cheap and skips this.
+fn calm_fetch_command(program: &str, args: &[&str]) -> Command {
+    let nice = git_niceness();
+    let mut cmd = if nice > 0 {
+        let mut c = Command::new("nice");
+        c.arg("-n").arg(nice.to_string()).arg(program).args(args);
+        c
+    } else {
+        let mut c = Command::new(program);
+        c.args(args);
+        c
+    };
+    cmd.env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "pack.threads")
+        .env("GIT_CONFIG_VALUE_0", git_pack_threads().to_string());
+    cmd
 }
 
 pub struct CheckoutTask {
@@ -270,8 +312,7 @@ async fn run_clone(slug: &str, dest: &Path) -> Result<()> {
             .await
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let status = Command::new("gh")
-        .args(["repo", "clone", slug, &dest.to_string_lossy()])
+    let status = calm_fetch_command("gh", &["repo", "clone", slug, &dest.to_string_lossy()])
         .status()
         .await
         .context("gh repo clone")?;
@@ -284,8 +325,7 @@ async fn run_clone(slug: &str, dest: &Path) -> Result<()> {
 
 async fn run_fetch(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy();
-    let status = Command::new("git")
-        .args(["-C", &path_str, "fetch", "origin"])
+    let status = calm_fetch_command("git", &["-C", &path_str, "fetch", "origin"])
         .status()
         .await
         .context("git fetch")?;
@@ -299,8 +339,7 @@ async fn run_fetch(path: &Path) -> Result<()> {
 async fn run_fetch_default_branch(path: &Path, branch: &str) -> Result<()> {
     let path_str = path.to_string_lossy();
     let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
-    let status = Command::new("git")
-        .args(["-C", &path_str, "fetch", "origin", &refspec])
+    let status = calm_fetch_command("git", &["-C", &path_str, "fetch", "origin", &refspec])
         .status()
         .await
         .context("git fetch default branch")?;
@@ -314,8 +353,7 @@ async fn run_fetch_default_branch(path: &Path, branch: &str) -> Result<()> {
 async fn run_fetch_pr_heads(path: &Path) -> Result<()> {
     let path_str = path.to_string_lossy();
     let before = git_pr_head_count(path).await?;
-    let status = Command::new("git")
-        .args(["-C", &path_str, "fetch", "--prune", "origin", "+refs/pull/*/head:refs/remotes/pr/*/head"])
+    let status = calm_fetch_command("git", &["-C", &path_str, "fetch", "--prune", "origin", "+refs/pull/*/head:refs/remotes/pr/*/head"])
         .status()
         .await
         .context("git fetch pull request heads")?;
