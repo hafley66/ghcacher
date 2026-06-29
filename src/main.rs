@@ -8,6 +8,7 @@ mod pidfile;
 mod query;
 mod setup;
 mod sync;
+mod worktree;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -225,6 +226,19 @@ async fn async_main(cli: Cli, cfg: config::ResolvedConfig) -> Result<()> {
                 });
                 Some(subs)
             };
+
+            // Local worktree scanner: independent of GitHub sync, runs even under
+            // --no-sync so the /worktrees snapshot + SSE deltas stay live.
+            {
+                let wt_pool = pool.clone();
+                let wt_roots = cfg.worktree_roots.clone();
+                let wt_interval = std::time::Duration::from_secs(cfg.worktree_scan_interval_seconds);
+                let wt_cap = cfg.worktree_scan_concurrency;
+                tokio::spawn(async move {
+                    worktree::watch_loop(wt_pool, wt_roots, wt_interval, wt_cap).await;
+                });
+            }
+
             if no_sync {
                 tracing::info!("--no-sync: HTTP server running, sync loop disabled");
                 loop { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }

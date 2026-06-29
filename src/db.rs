@@ -229,6 +229,7 @@ pub async fn log_call(conn: &mut SqliteConnection, entry: &CallLogEntry<'_>) -> 
 pub enum ChangeEvent {
     Inserted,
     Updated,
+    Deleted,
 }
 
 impl ChangeEvent {
@@ -236,6 +237,7 @@ impl ChangeEvent {
         match self {
             ChangeEvent::Inserted => "inserted",
             ChangeEvent::Updated  => "updated",
+            ChangeEvent::Deleted  => "deleted",
         }
     }
 }

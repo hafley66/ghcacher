@@ -542,6 +542,9 @@ mod tests {
                 fs_alias:             None,
             }],
             orgs: vec![],
+            worktree_roots: vec![],
+            worktree_scan_interval_seconds: 30,
+            worktree_scan_concurrency: 4,
             owner_fs_aliases: std::collections::HashMap::new(),
         }
     }
@@ -631,6 +634,9 @@ mod tests {
                 exclude:             vec![],
                 fs_alias:            None,
             }],
+            worktree_roots: vec![],
+            worktree_scan_interval_seconds: 30,
+            worktree_scan_concurrency: 4,
             owner_fs_aliases: std::collections::HashMap::new(),
         };
 
@@ -861,6 +867,9 @@ mod tests {
                 exclude: vec![],
                 fs_alias: None,
             }],
+            worktree_roots: vec![],
+            worktree_scan_interval_seconds: 30,
+            worktree_scan_concurrency: 4,
             owner_fs_aliases: std::collections::HashMap::new(),
         };
 
@@ -954,6 +963,9 @@ mod tests {
                 exclude: vec![],
                 fs_alias: None,
             }],
+            worktree_roots: vec![],
+            worktree_scan_interval_seconds: 30,
+            worktree_scan_concurrency: 4,
             owner_fs_aliases: std::collections::HashMap::new(),
         };
 
@@ -1057,6 +1069,9 @@ mod integration {
                 fs_alias:             None,
             }],
             orgs: vec![],
+            worktree_roots: vec![],
+            worktree_scan_interval_seconds: 30,
+            worktree_scan_concurrency: 4,
             owner_fs_aliases: std::collections::HashMap::new(),
         }
     }

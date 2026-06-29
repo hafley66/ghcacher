@@ -31,6 +31,13 @@ pub struct Global {
     pub heartbeat_ttl_seconds: Option<u64>,
     /// Sync the authenticated user's personal notification inbox (default false).
     pub sync_notifications: Option<bool>,
+    /// Directories scanned for local git worktrees during watch (default ["~/projects"]).
+    pub worktree_roots: Option<Vec<String>>,
+    /// Periodic fallback rescan interval for worktrees, seconds (default 30). The
+    /// fs watcher drives most rescans; this catches anything it misses.
+    pub worktree_scan_interval_seconds: Option<u64>,
+    /// Max concurrent `git status` subprocesses during a worktree sweep (default 4).
+    pub worktree_scan_concurrency: Option<usize>,
 }
 
 impl Default for Global {
@@ -47,6 +54,9 @@ impl Default for Global {
             cmd_port: Some(7748),
             heartbeat_ttl_seconds: Some(30),
             sync_notifications: None,
+            worktree_roots: None,
+            worktree_scan_interval_seconds: Some(30),
+            worktree_scan_concurrency: Some(4),
         }
     }
 }
@@ -119,6 +129,10 @@ pub struct ResolvedConfig {
     pub cmd_port: u16,
     pub heartbeat_ttl_seconds: u64,
     pub sync_notifications: bool,
+    /// Tilde-expanded dirs scanned for local git worktrees during watch.
+    pub worktree_roots: Vec<PathBuf>,
+    pub worktree_scan_interval_seconds: u64,
+    pub worktree_scan_concurrency: usize,
     pub repos: Vec<RepoConfig>,
     pub orgs: Vec<OrgConfig>,
     /// Maps GitHub owner name -> fs directory name (only entries with fs_alias set).
@@ -216,6 +230,15 @@ fn validate(config: Config) -> Result<ResolvedConfig> {
         cmd_port: config.global.cmd_port.unwrap_or(7748),
         heartbeat_ttl_seconds: config.global.heartbeat_ttl_seconds.unwrap_or(30),
         sync_notifications: config.global.sync_notifications.unwrap_or(false),
+        worktree_roots: config
+            .global
+            .worktree_roots
+            .unwrap_or_else(|| vec!["~/projects".to_string()])
+            .iter()
+            .map(|s| expand_tilde(s))
+            .collect(),
+        worktree_scan_interval_seconds: config.global.worktree_scan_interval_seconds.unwrap_or(30),
+        worktree_scan_concurrency: config.global.worktree_scan_concurrency.unwrap_or(4),
         repos: config.repos,
         orgs: config.orgs,
         owner_fs_aliases,

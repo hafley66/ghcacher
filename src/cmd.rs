@@ -234,7 +234,8 @@ pub async fn run(
 
     // Broadcast loop
     let clients_bcast = Arc::clone(&clients);
-    tokio::spawn(async move { broadcast_loop(clients_bcast, pool).await });
+    let pool_bcast = pool.clone();
+    tokio::spawn(async move { broadcast_loop(clients_bcast, pool_bcast).await });
 
     // Sweep loop
     let subs_sweep = Arc::clone(&subs);
@@ -252,8 +253,9 @@ pub async fn run(
         let staging = staging.clone();
         let paused = Arc::clone(&paused);
         let aliases = Arc::clone(&owner_fs_aliases);
+        let pool = pool.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, &subs, &staging, clients, paused, &aliases).await {
+            if let Err(e) = handle(stream, &subs, &staging, clients, paused, &aliases, &pool).await {
                 tracing::warn!(error = %e, "cmd: request failed");
             }
         });
@@ -304,6 +306,7 @@ async fn handle(
     clients: Clients,
     paused: Arc<AtomicBool>,
     owner_fs_aliases: &HashMap<String, String>,
+    pool: &SqlitePool,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
@@ -327,6 +330,16 @@ async fn handle(
                 last_sent_id: head.last_event_id,
             });
             Ok(())
+        }
+        ("GET", "/worktrees") => {
+            let body = match worktrees_snapshot(pool).await {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::warn!(error = %e, "worktrees snapshot failed");
+                    "[]".to_string()
+                }
+            };
+            respond_200(&mut writer, &body).await
         }
         ("POST", "/subscribe") => {
             let req: SubscribeReq = serde_json::from_slice(&body)?;
@@ -363,6 +376,32 @@ async fn respond_200(writer: &mut tokio::net::tcp::OwnedWriteHalf, body: &str) -
     );
     writer.write_all(resp.as_bytes()).await?;
     Ok(())
+}
+
+/// Current `worktree` table as a JSON array, field names matching the SSE
+/// `worktree` payloads (origin/clone/worktree/branch/head/is_main/dirty).
+async fn worktrees_snapshot(pool: &SqlitePool) -> Result<String> {
+    let rows = sqlx::query(
+        "SELECT origin, clone_path, path, branch, head, is_main, dirty
+         FROM worktree ORDER BY clone_path, is_main DESC, path",
+    )
+    .fetch_all(pool)
+    .await?;
+    let out: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "origin":   r.get::<Option<String>, _>(0).unwrap_or_default(),
+                "clone":    r.get::<String, _>(1),
+                "worktree": r.get::<String, _>(2),
+                "branch":   r.get::<String, _>(3),
+                "head":     r.get::<String, _>(4),
+                "is_main":  r.get::<i64, _>(5) != 0,
+                "dirty":    r.get::<i64, _>(6) != 0,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string(&out)?)
 }
 
 /// Clone repo to `{staging}/{fs_owner}/{repo}` if absent, then `git fetch --all`.

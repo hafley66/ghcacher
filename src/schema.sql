@@ -166,6 +166,22 @@ CREATE TABLE IF NOT EXISTS checkout (
     UNIQUE(repo_id, branch)
 );
 
+-- Local git worktrees discovered by filesystem scan (not GitHub-sourced). One
+-- row per `git worktree`. Sole writer is the watch-loop scanner; readers are the
+-- /worktrees snapshot endpoint and (via change_log + SSE) downstream UIs.
+CREATE TABLE IF NOT EXISTS worktree (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    clone_path  TEXT NOT NULL,      -- main worktree path (the clone root)
+    path        TEXT NOT NULL,      -- this worktree's path
+    branch      TEXT NOT NULL,
+    head        TEXT NOT NULL,      -- short sha
+    is_main     INTEGER NOT NULL,
+    dirty       INTEGER NOT NULL,
+    origin      TEXT,
+    scanned_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_pr_repo_state   ON pull_request(repo_id, state);
 CREATE INDEX IF NOT EXISTS idx_pr_updated      ON pull_request(updated_at);
 CREATE INDEX IF NOT EXISTS idx_event_repo_type ON repo_event(repo_id, type);
@@ -174,6 +190,7 @@ CREATE INDEX IF NOT EXISTS idx_notif_unread    ON notification(unread, updated_a
 CREATE INDEX IF NOT EXISTS idx_call_endpoint   ON call_log(endpoint, called_at);
 CREATE INDEX IF NOT EXISTS idx_change_log      ON change_log(entity_type, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_branch_repo     ON branch(repo_id);
+CREATE INDEX IF NOT EXISTS idx_worktree_clone  ON worktree(clone_path);
 
 CREATE VIEW IF NOT EXISTS v_open_prs AS
 SELECT
